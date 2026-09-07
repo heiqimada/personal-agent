@@ -1,0 +1,17 @@
+venv/
+data/
+__pycache__/
+
+
+# 隐私内容不入库：真实日记与真实冷启动档案（示例版见 scripts/seed_profiles.example.py）
+imports/
+scripts/seed_profiles.py
+.env
+.browser-print/
+prompts/reflect.txt
+
+# 内部规划与求职材料（不入库，公开仓库只留代码、README 与 eval 报告）
+docs/V2.6_任务书_真实数据进门.md
+docs/resume_snippets.md
+docs/个人Agent项目工程表.html
+docs/个人Agent项目工程表_2026-09-04.pdf

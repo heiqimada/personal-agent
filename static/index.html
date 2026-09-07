@@ -1,0 +1,1099 @@
+<!DOCTYPE html>
+<!--
+  模块职责：personal-agent 的单文件可视化前端（原生 HTML+CSS+JS）。
+  - 左侧/顶部侧边栏：展示 open 待办（GET /api/notes）；
+  - 主区：聊天界面（POST /api/chat），Agent 回复带「思考过程」折叠区。
+  - 不引入任何框架与 CDN：样式和脚本全部内联，离线也能打开页面。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <!-- viewport 是移动端正确缩放的唯一入口，缺了手机端会按桌面宽度渲染 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>个人 AI 助手</title>
+  <style>
+    /* ===== 设计变量：统一浅色主题、圆角与阴影，方便整体调色 ===== */
+    :root {
+      --bg: #f4f6fb;
+      --surface: #ffffff;
+      --border: #e6e9f2;
+      --text: #223047;
+      --muted: #7b8498;
+      --primary: #4f6ef7;
+      --primary-soft: #eef1fe;
+      --code-bg: #f5f7fc;
+      --danger: #d94b5f;
+      --radius: 14px;
+      --shadow: 0 1px 4px rgba(31, 41, 55, 0.06);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      /* 优先使用 macOS/移动端默认中文字体栈，避免引入网络字体 */
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+
+    /* ===== 整体布局：桌面左右两栏，手机由媒体查询改成上下结构 ===== */
+    .app {
+      display: flex;
+      /* 100dvh 更贴近真实可视区；先写 100vh 作为老浏览器兜底 */
+      height: 100vh;
+      height: 100dvh;
+    }
+
+    /* ===== 侧边栏（待办区） ===== */
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      width: 290px;
+      min-width: 290px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+    }
+
+    .sidebar-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-header h1 {
+      margin: 0;
+      font-size: 17px;
+    }
+
+    .icon-button {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 8px;
+    }
+
+    .icon-button:hover {
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .todo-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+      padding: 18px 8px;
+    }
+
+    .todo-item {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      word-break: break-word;
+    }
+
+    .todo-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .tag {
+      display: inline-block;
+      font-size: 11px;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+
+    /* 每种笔记类型一种柔和配色，扫一眼即可区分用途 */
+    .tag-task    { background: #e8edff; color: #3f51c9; }
+    .tag-wish    { background: #fde8f3; color: #b23b83; }
+    .tag-idea    { background: #dcf7f7; color: #0f7f86; }
+    .tag-emotion { background: #fdf0d6; color: #a06a08; }
+    .tag-plan    { background: #e4f6e8; color: #2c7a45; }
+    .tag-default { background: #eceef4; color: #5b6472; }
+
+    .todo-time {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .todo-content {
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    /* ===== 主区：聊天 ===== */
+    .main {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+    }
+
+    .chat-header {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 12px 18px;
+      background: rgba(255, 255, 255, 0.75);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(4px);
+    }
+
+    .chat-header h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .chat-header .subtitle {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* 消息滚动区必须 min-height:0，否则内容多了会把输入框挤出屏幕 */
+    .messages {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .message {
+      display: flex;
+      width: 100%;
+    }
+
+    .message.user {
+      justify-content: flex-end;
+    }
+
+    .message.agent {
+      justify-content: flex-start;
+    }
+
+    /* 圆角气泡：用户/Agent 各占一端；white-space 保留换行让长回复可读 */
+    .bubble {
+      max-width: 76%;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      font-size: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      box-shadow: var(--shadow);
+    }
+
+    .message.user .bubble {
+      background: var(--primary);
+      color: #ffffff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .message.agent .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+
+    .message.agent-body {
+      max-width: 86%;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    /* 思考过程折叠区：默认收起，需要时再展开，不打断阅读流 */
+    details.thinking {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+
+    details.thinking summary {
+      cursor: pointer;
+      color: var(--muted);
+      user-select: none;
+    }
+
+    details.thinking[open] summary {
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+
+    .no-tools {
+      color: var(--muted);
+      padding: 2px 0;
+    }
+
+    .tool-card {
+      border: 1px solid var(--border);
+      background: var(--primary-soft);
+      border-radius: 10px;
+      padding: 10px;
+      margin-bottom: 8px;
+    }
+
+    .tool-card:last-child {
+      margin-bottom: 0;
+    }
+
+    /* ===== trace 时间线：左侧竖线 + 圆点节点串起“模型思考/执行工具” ===== */
+    .trace-timeline {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 2px 0 2px 14px;
+    }
+
+    /* 竖线画在整个容器左侧，各卡片自然按数组顺序从上往下排 */
+    .trace-timeline::before {
+      content: "";
+      position: absolute;
+      left: 3px;
+      top: 8px;
+      bottom: 8px;
+      width: 2px;
+      background: var(--border);
+    }
+
+    .trace-card {
+      position: relative;
+    }
+
+    /* 每个节点一个圆点压在线条上，配合标题里的“第 N 轮”形成时间感 */
+    .trace-card::before {
+      content: "";
+      position: absolute;
+      left: -14px;
+      top: 13px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--primary);
+      border: 2px solid var(--surface);
+      box-shadow: 0 0 0 1px var(--border);
+    }
+
+    /* 模型步卡片：浅色独立卡片，与工具卡片区分“决定”与“执行” */
+    .model-step {
+      margin: 0;
+      background: #f8f9ff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+    }
+
+    .step-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .step-desc {
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    /* 正文预览刻意做成灰色小字，避免抢占“发生了什么”的视觉焦点 */
+    .step-preview {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* trace 里的工具步复用 tool-card 视觉；间距交给时间线 gap 管理 */
+    .tool-step {
+      margin-bottom: 0;
+    }
+
+    /* messages 调试视图：与工具卡片同级但视觉弱化，
+       用虚线分隔表示它只是“旁路观测”，不是对话内容的一部分 */
+    details.messages-view {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+
+    details.messages-view summary {
+      cursor: pointer;
+      color: var(--muted);
+      user-select: none;
+    }
+
+    details.messages-view[open] summary {
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    /* 调试说明与系统提示同框展示；整段 JSON 可能很长，
+       限制高度后内部滚动，避免撑爆整个思考折叠区 */
+    .debug-note {
+      color: var(--danger);
+      font-size: 11px;
+      line-height: 1.5;
+      margin: 4px 0 8px;
+    }
+
+    details.messages-view pre {
+      max-height: 360px;
+      overflow: auto;
+    }
+
+    .tool-name {
+      font-weight: 600;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+
+    .block-title {
+      color: var(--muted);
+      margin: 8px 0 4px;
+    }
+
+    /* pre 等宽 + 保留换行：args/result 是结构化文本，不能压缩成一行 */
+    .code {
+      margin: 0;
+      padding: 8px 10px;
+      background: var(--code-bg);
+      border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    .error-message {
+      text-align: center;
+      color: var(--danger);
+      font-size: 13px;
+      padding: 8px;
+    }
+
+    /* ===== 输入区 ===== */
+    .status-line {
+      min-height: 20px;
+      padding: 4px 18px 2px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .composer {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      padding: 10px 14px 14px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+    }
+
+    .composer textarea {
+      flex: 1;
+      resize: none;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+      outline: none;
+      background: var(--bg);
+      color: var(--text);
+      max-height: 140px;
+    }
+
+    .composer textarea:focus {
+      border-color: var(--primary);
+      background: var(--surface);
+    }
+
+    .composer textarea:disabled {
+      opacity: 0.65;
+    }
+
+    .send-button {
+      border: none;
+      background: var(--primary);
+      color: #ffffff;
+      font-size: 14px;
+      padding: 10px 18px;
+      border-radius: 12px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .send-button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    /* ===== 移动端（<640px）：侧边栏移到顶部，主区占满剩余高度 ===== */
+    @media (max-width: 639px) {
+      .app {
+        flex-direction: column;
+      }
+
+      /* 顶部待办区限高并允许内部滚动，避免把聊天区挤没 */
+      .sidebar {
+        width: 100%;
+        min-width: 0;
+        max-height: 34vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .todo-list {
+        flex-direction: row;
+        overflow-x: auto;
+        overflow-y: hidden;
+      }
+
+      .todo-item {
+        min-width: 220px;
+      }
+
+      .chat-header {
+        padding: 10px 12px;
+      }
+
+      .chat-header .subtitle {
+        display: none;
+      }
+
+      .messages {
+        padding: 12px;
+      }
+
+      /* 触屏目标别太小：输入区与按钮高度保持易点按 */
+      .composer {
+        padding: 8px 10px;
+      }
+
+      .bubble {
+        max-width: 88%;
+      }
+
+      .message.agent-body {
+        max-width: 94%;
+      }
+    }
+
+    /* 内层调试折叠块要“自成一体”：外层的 [open] 规则带 margin/颜色，
+       会意外作用到后代 summary，这里显式覆盖回来保证两级标题样式独立 */
+    details.thinking details.messages-view summary {
+      margin: 0 0 6px;
+      color: var(--muted);
+    }
+
+    details.thinking details.messages-view[open] summary {
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- 侧边栏：桌面在左，移动端通过 CSS 排到顶部 -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>待办</h1>
+        <button class="icon-button" id="refresh-todos" type="button" title="刷新待办">⟳</button>
+      </div>
+      <div class="todo-list" id="todo-list">
+        <div class="empty">加载中…</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="chat-header">
+        <h2>个人 AI 助手</h2>
+        <span class="subtitle">基于你的日记、笔记与长期记忆回答</span>
+      </header>
+
+      <!-- 消息区：用户/Agent 气泡都会 append 到这里 -->
+      <div class="messages" id="messages"></div>
+
+      <!-- 状态行：请求期间显示“思考中…”，平时保持占位防止布局跳动 -->
+      <div class="status-line" id="status-line"></div>
+
+      <!-- 输入区：回车发送（Shift+回车换行） -->
+      <form class="composer" id="chat-form">
+        <textarea
+          id="message-input"
+          rows="1"
+          placeholder="问我关于你日记的问题，或说“提醒我……”"
+          autocomplete="off"
+        ></textarea>
+        <button class="send-button" id="send-button" type="submit">发送</button>
+      </form>
+    </main>
+  </div>
+
+  <script>
+    // ===== 会话标识：localStorage 持久化 =====
+    // 为什么必须持久化：服务端用 session_id 关联历史消息；
+    // 每次刷新都换新 id 会让 Agent 丢失上文，像“失忆”一样。
+    // 为什么用 localStorage 而不是 cookie：这是纯前端单页，
+    // 后端不读 cookie，localStorage 更简单且不随请求带上多余状态。
+    const SESSION_STORAGE_KEY = "personal-agent-session-id";
+
+    // 类型显示文案与标签配色映射（后端只存英文枚举，前端负责本地化）
+    const NOTE_TYPE_LABELS = {
+      task: "任务",
+      wish: "愿望",
+      idea: "想法",
+      emotion: "情绪",
+      plan: "计划"
+    };
+    const NOTE_TYPE_CLASSES = {
+      task: "tag-task",
+      wish: "tag-wish",
+      idea: "tag-idea",
+      emotion: "tag-emotion",
+      plan: "tag-plan"
+    };
+
+    // 工具名 → 中文展示名：思考过程卡片里优先显示中文，保留原名便于对照接口
+    const TOOL_LABELS = {
+      search_journal: "检索日记",
+      create_note: "记录笔记",
+      save_profile: "保存画像"
+    };
+
+    // ===== DOM 引用集中声明，避免每次事件都重新查询 =====
+    const messagesEl = document.getElementById("messages");
+    const todoListEl = document.getElementById("todo-list");
+    const statusLineEl = document.getElementById("status-line");
+    const chatFormEl = document.getElementById("chat-form");
+    const messageInputEl = document.getElementById("message-input");
+    const sendButtonEl = document.getElementById("send-button");
+    const refreshButtonEl = document.getElementById("refresh-todos");
+
+    // 是否正在等后端：防止用户连续发送导致上下文/状态错乱
+    let busy = false;
+
+    /**
+     * 取（或创建并持久化）本浏览器的 session_id。
+     * 返回：session_id 字符串。
+     * crypto.randomUUID() 需要安全上下文，127.0.0.1 满足要求；
+     * localStorage 在隐私模式下可能抛异常，读取/写入都要容错。
+     */
+    function getSessionId() {
+      let sessionId = "";
+      try {
+        sessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
+      } catch (error) {
+        console.warn("无法读取 localStorage，本次将使用临时会话：", error);
+      }
+      if (!sessionId) {
+        sessionId = crypto.randomUUID();
+        try {
+          localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+        } catch (error) {
+          console.warn("无法写入 localStorage，会话只在本次页面生效：", error);
+        }
+      }
+      return sessionId;
+    }
+
+    /**
+     * DOM 创建小工具：所有文本用 textContent 赋值而非 innerHTML，
+     * 从根上避免用户/模型内容里的 HTML 被当标签执行（XSS 防护）。
+     */
+    function createEl(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) {
+        node.className = className;
+      }
+      if (text !== undefined && text !== null) {
+        node.textContent = text;
+      }
+      return node;
+    }
+
+    /**
+     * 把 ISO 时间格式化成“MM-DD HH:mm”。
+     * 参数非法时原样返回，避免异常输入让整个列表渲染失败。
+     */
+    function formatTime(isoString) {
+      const date = new Date(isoString);
+      if (Number.isNaN(date.getTime())) {
+        return isoString;
+      }
+      const pad = function (value) {
+        return String(value).padStart(2, "0");
+      };
+      return (
+        pad(date.getMonth() + 1) +
+        "-" +
+        pad(date.getDate()) +
+        " " +
+        pad(date.getHours()) +
+        ":" +
+        pad(date.getMinutes())
+      );
+    }
+
+    /**
+     * 拉取 /api/notes 并渲染待办列表。
+     * 页面加载与每次聊天结束都会调用——Agent 的 create_note
+     * 会写库，只有重新拉取侧边栏才能看到最新记录。
+     */
+    async function loadTodos() {
+      todoListEl.replaceChildren(createEl("div", "empty", "加载中…"));
+      try {
+        const response = await fetch("/api/notes");
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        const items = await response.json();
+        renderTodos(items);
+      } catch (error) {
+        console.error("待办加载失败：", error);
+        todoListEl.replaceChildren(
+          createEl("div", "empty", "待办加载失败，点右上角重试")
+        );
+      }
+    }
+
+    /**
+     * 把待办数组渲染成侧边栏卡片列表。
+     * 参数：items——后端返回的 [{id, type, content, created_at}, ...]。
+     */
+    function renderTodos(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        todoListEl.replaceChildren(createEl("div", "empty", "暂无待办"));
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      items.forEach(function (item) {
+        const card = createEl("div", "todo-item");
+        const top = createEl("div", "todo-top");
+
+        // 未知类型仍显示原文并使用中性色，不因后端新增枚举而报错
+        const type = item.type || "unknown";
+        const tagClass = NOTE_TYPE_CLASSES[type] || "tag-default";
+        const tagText = NOTE_TYPE_LABELS[type] || type;
+        top.appendChild(createEl("span", "tag " + tagClass, tagText));
+        top.appendChild(createEl("span", "todo-time", formatTime(item.created_at)));
+
+        card.appendChild(top);
+        card.appendChild(createEl("div", "todo-content", item.content || ""));
+        fragment.appendChild(card);
+      });
+      todoListEl.replaceChildren(fragment);
+    }
+
+    /**
+     * 渲染一条用户消息（靠右蓝气泡）。
+     */
+    function appendUserMessage(text) {
+      const wrapper = createEl("div", "message user");
+      wrapper.appendChild(createEl("div", "bubble", text));
+      messagesEl.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    /**
+     * 渲染一条 Agent 回复：正文气泡 + 下方「思考过程」折叠区。
+     * trace 是新的逐轮时间线；tool_calls/messages 缺失时兼容旧后端；
+     * messages 为本轮实际发给模型的完整上下文，缺失时不渲染调试块。
+     */
+    function appendAgentMessage(content, toolCalls, messages, trace) {
+      const wrapper = createEl("div", "message agent");
+      const body = createEl("div", "message agent-body");
+      const text = (content || "").trim();
+      body.appendChild(
+        createEl("div", "bubble", text || "（本轮没有返回文字回复）")
+      );
+      body.appendChild(
+        buildThinkingDetails(
+          Array.isArray(toolCalls) ? toolCalls : [],
+          messages,
+          trace
+        )
+      );
+      wrapper.appendChild(body);
+      messagesEl.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    /**
+     * 构建“🧠 思考过程”折叠区。
+     * 有工具调用时逐张渲染卡片；没有时给出明确占位文案，
+     * 让用户知道 Agent 确实“直接回答”而非漏掉了处理步骤。
+     * trace 存在时按“模型步/工具步”渲染时间线；
+     * trace 缺失（旧后端）再退回 tool_calls 卡片逻辑，保证页面不坏。
+     * messages 调试视图放在折叠区最底部，与工具卡片同级展示。
+     */
+    function buildThinkingDetails(toolCalls, messages, trace) {
+      const details = createEl("details", "thinking");
+      details.appendChild(createEl("summary", "", "🧠 思考过程"));
+
+      if (Array.isArray(trace) && trace.length > 0) {
+        // 新后端：trace 已包含“模型直接回答”这一步，
+        // 不能再显示旧的“本轮未调用工具”占位，否则会误导
+        details.appendChild(buildTraceTimeline(trace));
+      } else if (toolCalls.length === 0) {
+        // 旧后端降级路径：只有 tool_calls 时仍保留原有提示
+        details.appendChild(createEl("div", "no-tools", "本轮未调用工具，直接回答"));
+      } else {
+        const container = createEl("div", "tool-cards");
+        toolCalls.forEach(function (toolCall) {
+          container.appendChild(buildToolCard(toolCall));
+        });
+        details.appendChild(container);
+      }
+
+      // 无 messages 字段时不显示（可能是旧后端响应），保持页面兼容
+      const messagesView = buildMessagesView(messages);
+      if (messagesView) {
+        details.appendChild(messagesView);
+      }
+      return details;
+    }
+
+    /**
+     * 把 trace 数组渲染成纵向时间线。
+     * trace 元素只有两种 kind：model（模型思考）与 tool（工具执行）；
+     * 按数组顺序遍历即得到真实发生顺序，不依赖 round 字段排序。
+     */
+    function buildTraceTimeline(trace) {
+      const timeline = createEl("div", "trace-timeline");
+      trace.forEach(function (step, index) {
+        if (step && step.kind === "model") {
+          timeline.appendChild(buildModelStepCard(step, index));
+        } else if (step && step.kind === "tool") {
+          timeline.appendChild(buildTraceToolCard(step, index));
+        }
+        // 未知 kind 直接跳过：宁可少显示一步，也不渲染错误内容误导用户
+      });
+      return timeline;
+    }
+
+    /**
+     * 构建“模型思考”步卡片。
+     * 用 round 或数组下标推导“第 N+1 轮”，展示模型决定了什么；
+     * content 只预览前 100 字，详情在气泡正文里看即可。
+     */
+    function buildModelStepCard(step, index) {
+      const roundNo =
+        typeof step.round === "number" ? step.round + 1 : index + 1;
+      const card = createEl("div", "trace-card model-step");
+      card.appendChild(
+        createEl("div", "step-title", "🤖 第 " + roundNo + " 轮 · 模型思考")
+      );
+
+      // tools_requested 空数组=模型这轮没调工具；
+      // 这正是旧 tool_calls 结构表达不了的“纯闲聊也请求了模型”的信息
+      const requested = Array.isArray(step.tools_requested)
+        ? step.tools_requested
+        : [];
+      const desc =
+        requested.length > 0
+          ? "模型决定调用工具：" + requested.join("、")
+          : "模型直接给出回答，未调用工具";
+      card.appendChild(createEl("div", "step-desc", desc));
+
+      const content = (step.content || "").trim();
+      if (content) {
+        const preview =
+          content.length > 100 ? content.slice(0, 100) + "…" : content;
+        card.appendChild(
+          createEl("div", "step-preview", "回答正文预览：" + preview)
+        );
+      }
+      return card;
+    }
+
+    /**
+     * 构建“执行工具”步卡片：复用现有工具卡片外观，
+     * 仅把标题替换成带轮次与中文名的“第 N 轮 · 执行工具”格式。
+     */
+    function buildTraceToolCard(step, index) {
+      const rawName = step.tool || "unknown_tool";
+      const displayName = TOOL_LABELS[rawName] || rawName;
+      const roundNo =
+        typeof step.round === "number" ? step.round + 1 : index + 1;
+      const title =
+        "🔧 第 " +
+        roundNo +
+        " 轮 · 执行工具：" +
+        displayName +
+        "（" +
+        rawName +
+        "）";
+      // step 的 tool/args/result 与旧 tool_calls 元素同构，可直接复用渲染
+      return buildToolCard(step, title, "trace-card tool-card tool-step");
+    }
+
+    /**
+     * 构建“📜 messages 数组”调试折叠块。
+     * 参数：messages——后端本轮发给模型的完整消息数组（可缺省）。
+     * 返回：details 元素；数组缺失或为空时返回 null（上层决定不显示）。
+     */
+    function buildMessagesView(messages) {
+      if (!Array.isArray(messages) || messages.length === 0) {
+        return null;
+      }
+
+      const view = createEl("details", "messages-view");
+      view.appendChild(
+        createEl(
+          "summary",
+          "",
+          "📜 messages 数组（本轮发给模型的完整上下文）"
+        )
+      );
+
+      // 此视图包含完整 system 提示词，等于把“内部提示工程”暴露给页面；
+      // 本地调试/教学很有用，但公网部署必须移除该块（见下方提示与注释）
+      view.appendChild(
+        createEl(
+          "div",
+          "debug-note",
+          "⚠️ 此视图会暴露系统提示词与完整上下文，仅用于本地调试，公网部署时应关闭。"
+        )
+      );
+
+      // JSON.stringify(…, null, 2) 负责缩进美化；
+      // 内容再交给 .code（pre + textContent）渲染，保留格式且不执行 HTML
+      const jsonPre = createEl(
+        "pre",
+        "code",
+        JSON.stringify(messages, null, 2)
+      );
+      view.appendChild(jsonPre);
+      return view;
+    }
+
+    /**
+     * 构建单个工具卡片：工具名 + 美化后的 args + 原始 result。
+     * 返回结构按后端契约 {tool, args, result}；字段缺失时做兜底。
+     * className 与 titleOverride 供时间线里的工具步复用本卡片样式。
+     */
+    function buildToolCard(toolCall, titleOverride, className) {
+      const card = createEl("div", className || "tool-card");
+      const rawName = toolCall.tool || "unknown_tool";
+      const displayName = TOOL_LABELS[rawName] || rawName;
+
+      const head = createEl("div", "tool-name");
+      head.textContent =
+        titleOverride || "工具：" + displayName + "（" + rawName + "）";
+      card.appendChild(head);
+
+      const argsTitle = createEl("div", "block-title", "参数（args）");
+      card.appendChild(argsTitle);
+
+      // args 是模型生成的 JSON 字符串；JSON.stringify(…, null, 2)
+      // 能缩进换行，比直接展示一长串更好读
+      const argsPre = createEl("pre", "code", prettyJson(toolCall.args));
+      card.appendChild(argsPre);
+
+      const resultTitle = createEl("div", "block-title", "工具返回（result）");
+      card.appendChild(resultTitle);
+
+      // pre + textContent 同时做到“保留换行”与“不执行 HTML”，
+      // 后端结果即使含 <script> 也只会被当纯文本展示
+      const resultPre = createEl(
+        "pre",
+        "code",
+        toolCall.result === undefined || toolCall.result === null
+          ? "（无返回结果）"
+          : String(toolCall.result)
+      );
+      card.appendChild(resultPre);
+      return card;
+    }
+
+    /**
+     * 把工具参数字符串格式化成美观的 JSON。
+     * 为什么 try/catch：模型偶尔返回空串或非法 JSON；
+     * 直接 JSON.parse 会抛异常中断整条消息渲染，
+     * 所以解析失败时原样展示字符串让用户/开发者能看到真实数据。
+     */
+    function prettyJson(raw) {
+      if (typeof raw !== "string" || raw.trim() === "") {
+        return "";
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        return JSON.stringify(parsed, null, 2);
+      } catch (error) {
+        return raw;
+      }
+    }
+
+    /**
+     * 把聊天滚动区滚到最底部，新气泡出现时始终可见。
+     * 用 scrollTop=scrollHeight 比 scrollIntoView 更直接，不改变焦点。
+     */
+    function scrollToBottom() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    /**
+     * 输入框自动增高：内容多时不再需要滚动小框，
+     * 但限制 max-height，避免长文本把发送按钮挤到看不见。
+     */
+    function autoResizeInput() {
+      messageInputEl.style.height = "auto";
+      const nextHeight = Math.min(messageInputEl.scrollHeight, 140);
+      messageInputEl.style.height = nextHeight + "px";
+    }
+
+    /**
+     * 切换“请求中”状态：禁用输入与发送按钮，并显示思考中。
+     * 为什么必须禁用：同一条 user 消息只应发给后端一次，
+     * 否则多轮并发请求会打乱 messages 表与 LLM 上下文的先后顺序。
+     */
+    function setBusy(nextBusy) {
+      busy = nextBusy;
+      messageInputEl.disabled = nextBusy;
+      sendButtonEl.disabled = nextBusy;
+      statusLineEl.textContent = nextBusy ? "思考中…" : "";
+    }
+
+    /**
+     * 发送当前输入框内容：构造 payload → 调 /api/chat → 渲染结果。
+     * 成功/失败都会把输入框还回来，并自动滚动到最新内容。
+     */
+    async function sendMessage() {
+      const text = messageInputEl.value.trim();
+      if (!text || busy) {
+        return;
+      }
+
+      setBusy(true);
+      messageInputEl.value = "";
+      autoResizeInput();
+      appendUserMessage(text);
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            session_id: getSessionId()
+          })
+        });
+
+        // 后端错误可能是 JSON（FastAPI 校验错误）也可能是纯文本（500），
+        // 先按 JSON 解析，失败再退回纯文本，保证任何失败都有可见提示
+        let data = null;
+        try {
+          data = await response.json();
+        } catch (error) {
+          const plain = await response.text();
+          throw new Error(plain || "HTTP " + response.status);
+        }
+
+        if (!response.ok) {
+          const detail = data && data.detail;
+          if (typeof detail === "string") {
+            throw new Error(detail);
+          }
+          throw new Error("请求失败（HTTP " + response.status + "）");
+        }
+
+        appendAgentMessage(
+          data.reply,
+          data.tool_calls,
+          data.messages,
+          data.trace
+        );
+        // Agent 可能刚通过 create_note 写了新待办，刷新侧边栏保持一致
+        await loadTodos();
+      } catch (error) {
+        console.error("聊天请求失败：", error);
+        const wrapper = createEl("div", "message agent");
+        const body = createEl("div", "message agent-body");
+        body.appendChild(
+          createEl("div", "bubble", "出错了：" + (error.message || "未知错误"))
+        );
+        wrapper.appendChild(body);
+        messagesEl.appendChild(wrapper);
+        scrollToBottom();
+      } finally {
+        setBusy(false);
+        messageInputEl.focus();
+      }
+    }
+
+    // ===== 事件绑定 =====
+    chatFormEl.addEventListener("submit", function (event) {
+      event.preventDefault(); // 表单默认提交会刷新整页，必须阻止
+      sendMessage();
+    });
+
+    // 回车即发送；Shift+回车保留多行输入能力（聊天场景更常用）
+    messageInputEl.addEventListener("keydown", function (event) {
+      // isComposing 为 true 表示正在中文输入法选词，此时的回车是“确认候选词”，
+      // 若不判断会把还没写好的句子提前发出去
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
+
+    messageInputEl.addEventListener("input", autoResizeInput);
+    refreshButtonEl.addEventListener("click", loadTodos);
+
+    // 首屏欢迎语放在真实对话之外，不用“思考过程”模板
+    const welcome = createEl("div", "message agent");
+    const welcomeBody = createEl("div", "message agent-body");
+    welcomeBody.appendChild(
+      createEl(
+        "div",
+        "bubble",
+        "你好，我是你的个人 AI 助手。可以问我关于日记的问题，也可以说“提醒我……”让我帮你记下待办。"
+      )
+    );
+    welcome.appendChild(welcomeBody);
+    messagesEl.appendChild(welcome);
+
+    // 页面打开就加载待办；之后由发送按钮/手动刷新维护
+    loadTodos();
+  </script>
+</body>
+</html>
