@@ -201,6 +201,57 @@ def add_profile(category, content, source="agent"):
         return cursor.lastrowid
 
 
+def upsert_journal(source, title, content, written_at):
+    """按「来源+日期+标题」判重写入日记：有则 UPDATE、无则 INSERT。
+
+    参数：
+        source：日记来源（manual / apple_notes/自我思考记 等）；
+        title：日记标题；
+        content：日记正文（由调用方保证已 strip）；
+        written_at：日记落笔日期（yyyy-mm-dd 或空字符串）。
+    返回：(journal_id, created)；created=True 表示本次是新增，
+        False 表示命中已有行并覆盖其 content。
+
+    为什么用 SELECT+UPDATE/INSERT 而不是 INSERT OR REPLACE / 唯一索引：
+    REPLACE 是「删旧行再插新行」，journal_id 会变；向量库切片 id
+    形如 journal_{journal_id}_chunk_{i}，id 一变旧切片就成了查不到的
+    孤儿。先按业务键 SELECT，命中就 UPDATE、未命中才 INSERT，
+    才能保住 journal_id 稳定，重复导入只覆盖同 id 内容。
+
+    为什么 written_at 为空时不判重、直接 INSERT：空日期说明来源/时间
+    不可信，拿它和别人的 source+title 做匹配会误伤（比如把两篇同标题
+    笔记错误合并）。该分支宁可每次新增，也不冒险合并。
+    """
+    written_at = written_at or ""  # None/空统一成空串，便于下方判空
+    with get_conn() as conn:
+        if written_at:
+            # 倒序取最近一条：理论上同键不应重复，若历史脏数据有重复，
+            # 覆盖最新的那一条即可，不扩大误伤面
+            row = conn.execute(
+                """
+                SELECT id FROM journal
+                WHERE source = ? AND written_at = ? AND title = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (source, written_at, title),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE journal SET content = ? WHERE id = ?",
+                    (content, row["id"]),
+                )
+                return row["id"], False
+
+        cursor = conn.execute(
+            """
+            INSERT INTO journal (source, title, content, written_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source, title, content, written_at, now_iso()),
+        )
+        return cursor.lastrowid, True
+
+
 if __name__ == "__main__":
     # 直接运行本文件时初始化数据库，便于手动建库
     init_db()

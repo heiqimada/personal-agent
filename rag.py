@@ -99,11 +99,24 @@ def embed_texts(texts):
     return [item.embedding for item in ordered]
 
 
-def add_journal(journal_id, text, title=""):
-    """切片 → 逐条 embedding → 入库。metadata 带 journal_id（以及可选 title）。
+def add_journal(journal_id, text, title="", written_at="", source="manual"):
+    """切片 → 逐条 embedding → 入库。metadata 带 journal_id/title/written_at/source。
 
-    text 为实际要切分入库的正文；由调用方决定是否把 title 拼进 text。
+    参数：
+        journal_id：日记主键（向量切片 id 的一部分，重复导入靠它保持稳定）；
+        text：实际切片入库的正文（调用方决定是否拼 title）；
+        title：日记标题，冗余存一份便于排查；
+        written_at：日记落笔日期，由导入链路传入，缺省空字符串；
+        source：日记来源（如 manual / apple_notes/自我思考记），缺省 manual。
+    返回：实际入库的切片数（空正文返回 0）。
+
+    为什么默认值写死空字符串而不是 None：ChromaDB 的 metadata 值
+    不允许 None（只接受 str/int/float/bool），缺失字段必须给 ""，
+    否则入库时会抛异常或写入脏值。
     """
+    written_at = written_at or ""   # 防御：调用方传 None 也归一为空串，防 Chroma 报错
+    source = source or ""
+
     chunks = split_text(text)
     if not chunks:
         return 0  # 空正文不入库
@@ -121,6 +134,10 @@ def add_journal(journal_id, text, title=""):
             {
                 "journal_id": journal_id,  # 检索结果据此回溯到日记主键
                 "title": title,            # 冗余标题便于排查与展示
+                # written_at/source 由 /api/import 透传进来；
+                # 空值一律用 ""，理由见函数 docstring（Chroma 禁 None）
+                "written_at": written_at,
+                "source": source,
                 "chunk_index": i,          # 同一篇日记内的切片序号
             }
             for i in range(len(chunks))
@@ -132,7 +149,9 @@ def add_journal(journal_id, text, title=""):
 def search(query, top_k=3):
     """query embedding → ChromaDB 检索。
 
-    返回：[{"content", "journal_id", "distance"}, ...]（按相关度升序）
+    返回：[{"content", "journal_id", "written_at", "source", "distance"}, ...]
+    （按相关度升序）；written_at/source 从 metadata 读取，缺失给空字符串，
+    保证调用方（tools.py 抬头拼接）不需要做 None 分支。
     """
     collection = _get_collection()
     count = collection.count()
@@ -157,6 +176,8 @@ def search(query, top_k=3):
             {
                 "content": content,
                 "journal_id": meta.get("journal_id"),
+                "written_at": meta.get("written_at") or "",
+                "source": meta.get("source") or "",
                 "distance": distance,
             }
         )

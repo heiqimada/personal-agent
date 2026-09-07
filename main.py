@@ -100,29 +100,31 @@ class ChatPayload(BaseModel):
 # ===== V1：日记导入接口 =====
 @app.post("/api/import")
 def import_journal(payload: ImportPayload):
-    """写入 journal 表并同步建立向量索引。"""
+    """按「来源+日期+标题」幂等写入 journal 表并同步建立向量索引。"""
     content = payload.content.strip()  # 去掉首尾空白，空正文直接拒绝
     if not content:
         raise HTTPException(status_code=400, detail="content 不能为空")
 
-    # 1) 先落库，拿到自增主键 journal_id
-    with get_conn() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO journal (source, title, content, written_at, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (payload.source, payload.title, content, payload.written_at, db.now_iso()),
-        )
-        journal_id = cursor.lastrowid  # 读取 SQLite 自增主键
+    # 1) upsert 落库：命中已有同键行就 UPDATE 并沿用原 id，
+    #    未命中才 INSERT 新行；created 供导入脚本打印「新增/更新」
+    journal_id, created = db.upsert_journal(
+        payload.source,
+        payload.title,
+        content,
+        payload.written_at,
+    )
 
     # 2) 再建向量索引：标题+正文一起切片入库，保证后续 RAG 能检索到
+    #    这里把 written_at/source 一起透传，向量 metadata 才能带日期和来源
     rag.add_journal(
         journal_id,
         payload.title + "\n" + content,
         title=payload.title,
+        written_at=payload.written_at,
+        source=payload.source,
     )
-    return {"ok": True, "journal_id": journal_id}  # 返回新日记 id 供前端使用
+    # created 会随响应返回，前端/导入脚本据此区分新增与覆盖
+    return {"ok": True, "journal_id": journal_id, "created": created}
 
 
 # ===== V2：Agent 聊天接口（工具调用循环替代 V1 焊死检索） =====

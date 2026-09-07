@@ -40,14 +40,28 @@ def search_journal(query):
 
     lines = []
     for hit in relevant:
-        # 每条命中固定带 [日记#id]（距离0.xx），模型回答时可直接引用编号；
-        # 距离保留两位小数既够人读，也不会把浮点误差暴露给模型
-        lines.append(
-            "[日记#{id}]（距离{distance:.2f}）\n{content}".format(
-                id=hit["journal_id"],
+        # 每条命中抬头带 [日记#id · 日期 · 来源]（距离0.xx），
+        # 让模型回答时能直接引用日期和来源；距离保留两位小数，
+        # 既够人读也不会把浮点误差暴露给模型
+        journal_id = hit["journal_id"]
+        written_at = str(hit.get("written_at") or "").strip()
+        source = str(hit.get("source") or "").strip()
+        # 日期/来源为空时对应片段整体省略（不许拼出“·  ·”空架子），
+        # 因此只把非空片段用“ · ”连接进方括号
+        meta_parts = [part for part in (written_at, source) if part]
+        if meta_parts:
+            head = "[日记#{id} · {meta}]（距离{distance:.2f}）".format(
+                id=journal_id,
+                meta=" · ".join(meta_parts),
                 distance=hit["distance"],
-                content=hit["content"],
             )
+        else:
+            head = "[日记#{id}]（距离{distance:.2f}）".format(
+                id=journal_id,
+                distance=hit["distance"],
+            )
+        lines.append(
+            head + "\n" + hit["content"]
         )
     return "\n\n".join(lines)
 
