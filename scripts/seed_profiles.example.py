@@ -28,7 +28,9 @@ import db
 
 
 # source 固定标识本批次，DELETE 时只删"本脚本写过的数据"，
-# 不误伤手动档案或 Agent 运行时通过 save_profile 写入的画像
+# 不误伤手动档案或 Agent 运行时通过 save_profile 写入的画像；
+# 同一个标记也会写进 profile_history.source，审计时一眼能区分
+# 「冷启动灌进来的种子」和「Agent 在对话里新加的画像」
 SEED_SOURCE = "seed_example"
 
 
@@ -62,41 +64,24 @@ def seed_profiles():
     """幂等灌库：先删除本 source 的旧档案，再在同一事务内批量写入。
 
     返回：{"deleted": 删除条数, "inserted": [{"id", "category", "preview"}, ...]}。
+
+    写库动作整体下沉到 db.replace_profiles_by_source()：
+    项目约定「业务写操作只能经 db.py」，脚本自己拼 DELETE/INSERT 会绕过
+    画像修订历史（profiles 与 profile_history 必须成对写入）。
+    这里只负责把本批档案打包交给数据层，并在返回值里补上给人看的预览串。
     """
-    conn = db.get_conn()
-    try:
-        cursor = conn.execute(
-            "DELETE FROM profiles WHERE source = ?",
-            (SEED_SOURCE,),
-        )
-        deleted = cursor.rowcount
-
-        now = db.now_iso()  # 同批档案共用一个时间戳
-        inserted = []
-        for category, content in PROFILES:
-            row_cursor = conn.execute(
-                """
-                INSERT INTO profiles (category, content, source, status, created_at, updated_at)
-                VALUES (?, ?, ?, 'active', ?, ?)
-                """,
-                (category, content, SEED_SOURCE, now, now),
-            )
-            inserted.append(
-                {
-                    "id": row_cursor.lastrowid,
-                    "category": category,
-                    # 只保留前 20 字用于日志回显，避免整段画像刷屏
-                    "preview": content[:20] + ("…" if len(content) > 20 else ""),
-                }
-            )
-
-        conn.commit()  # 全部成功才落盘；异常走 except 的 rollback
-        return {"deleted": deleted, "inserted": inserted}
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    result = db.replace_profiles_by_source(SEED_SOURCE, PROFILES)
+    result["inserted"] = [
+        {
+            "id": item["id"],
+            "category": item["category"],
+            # 只保留前 20 字用于日志回显，避免整段画像刷屏
+            "preview": item["content"][:20]
+            + ("…" if len(item["content"]) > 20 else ""),
+        }
+        for item in result["inserted"]
+    ]
+    return result
 
 
 def main():

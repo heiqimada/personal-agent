@@ -1,9 +1,23 @@
-"""个人 AI Agent 的 SQLite 持久化层。
+"""个人 AI Agent 的 SQLite 持久化层——全项目唯一的业务写入口。
 
 - 只使用标准库 sqlite3，不引入第三方数据库依赖；
 - 数据库文件位于 data/agent.db；
 - 时间统一存成 ISO-8601 字符串；
 - 所有 SQL 一律使用 ? 占位符，避免拼接注入。
+
+项目约定（写操作收口）：
+    所有业务写操作（INSERT / UPDATE / DELETE）只能经由本模块的函数进行，
+    main.py / tools.py / agent.py / memory.py 等上层模块一律不得直接
+    conn.execute("INSERT/UPDATE/DELETE")。
+
+    为什么定这条规矩：写操作散落在各层时，审计（改了哪张表、要不要记历史、
+    时间戳怎么打）就得在每个调用点各写一遍，迟早出现「有的路径记了 updated_at、
+    有的没记」这种不一致。收口到 db.py 后，新增一条业务规则只需要改一个文件，
+    也保证每次写入都走同一套时间戳/事务/历史记录逻辑。
+
+    注意这是代码层面的约定，不是技术上的强制：本地单用户，数据库文件本来
+    就可读写（用 SQLite Viewer 直接改也是允许的）。本模块不引入权限系统、
+    文件锁之类的机制——那是过度设计。
 """
 
 import os
@@ -32,9 +46,31 @@ CREATE TABLE IF NOT EXISTS profiles (
     content TEXT NOT NULL,
     source TEXT,                         -- 来源：手动录入 / 反思生成
     status TEXT DEFAULT 'active',        -- 启用状态
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL,            -- 首次入库时间
+    updated_at TEXT NOT NULL             -- 最近一次内容改动时间（应用层维护，见 add_profile/update_profile）
 );
+
+-- profile_history：画像修订历史（审计用，只增不删）
+-- 为什么要有这张表：profiles 是「持续修订」的表，画像被改过之后
+-- 表里只剩新值，改歪了无从回滚、也无从知道谁在什么时候改的；
+-- 每次创建/修改都留一条记录，历史才可回溯。
+CREATE TABLE IF NOT EXISTS profile_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- profile_id 是任务书列清单之外我加的一列：同名 category 在 profiles 里
+    -- 会有多行（实测 goal/pain_point 各 6 行），只按 category 记历史
+    -- 无法回答「改的是哪一行」，回滚时会改错行；加上主键引用才真正可审计
+    profile_id INTEGER,                  -- 对应 profiles.id
+    user_id TEXT DEFAULT 'local',        -- 预留多用户字段
+    category TEXT,                       -- 对应 profiles.category
+    old_content TEXT,                    -- 修订前内容；首次创建为 NULL
+    new_content TEXT,                    -- 修订后内容
+    source TEXT,                         -- 写入来源：agent（save_profile 工具）/ seed（灌库脚本）
+    changed_at TEXT                      -- 本次变更时间（ISO-8601）
+);
+
+-- 按画像行查历史是最常用的审计姿势（改歪了看这一行被谁改成什么）
+CREATE INDEX IF NOT EXISTS idx_profile_history_profile
+    ON profile_history(profile_id, id);
 
 -- journal：用户日记原文
 CREATE TABLE IF NOT EXISTS journal (
@@ -105,7 +141,7 @@ def _migrate(conn):
     参数：
         conn：已打开的连接（由 init_db 传入，共用同一事务）。
     返回：无。
-    副作用：必要时执行 ALTER TABLE ADD COLUMN（幂等，已存在则跳过）。
+    副作用：必要时执行 ALTER TABLE ADD COLUMN 与回填 UPDATE（均幂等）。
 
     为什么必须显式迁移：老用户库里的 notes 表在 V5 之前就建好了，
     重跑 SCHEMA 只会发现表已存在、直接跳过，source_message_id 永远不会出现，
@@ -115,14 +151,36 @@ def _migrate(conn):
     SQLite 的 ALTER TABLE ADD COLUMN 不需要重建表、不锁数据，
     老行自动填 NULL，正好符合「历史计划无法溯源」的预期。
     """
-    existing = {
+    note_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(notes)").fetchall()
     }
-    if "source_message_id" not in existing:
+    if "source_message_id" not in note_cols:
         conn.execute("ALTER TABLE notes ADD COLUMN source_message_id INTEGER")
 
+    # ---- V7：profiles.updated_at ----
+    # 极老的库（V0 初版）只有 created_at，缺这一列
+    profile_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+    }
+    if "updated_at" not in profile_cols:
+        # 注意不能带 NOT NULL：SQLite 的 ADD COLUMN 对已有行没有值可填，
+        # 只允许带非空默认值的 NOT NULL；这里先按可空加上，再用下面的
+        # 回填把语义补成「永远有值」（新库走 SCHEMA，本来就是 NOT NULL）
+        conn.execute("ALTER TABLE profiles ADD COLUMN updated_at TEXT")
 
-# ===== V2：新增 CRUD 辅助函数（不改四张表 DDL，全部走既有表结构） =====
+    # 回填既有行的 updated_at：迁移这一刻没有比 created_at 更可信的信息，
+    # 用创建时间兜底比留 NULL 更安全——上层（列表/导出）可以放心地把它
+    # 当普通字符串用，不必到处判空。这条 UPDATE 对没有 NULL 的库是空操作，
+    # 所以每次启动跑一遍也无害（幂等）
+    conn.execute(
+        "UPDATE profiles SET updated_at = created_at WHERE updated_at IS NULL"
+    )
+
+
+# ===== V2 起新增的 CRUD 辅助函数（上层模块只调这里，不自己拼写 SQL） =====
+# 说明：V7 出于审计需要新增了 profile_history 表，并给 profiles 补了
+# updated_at 语义，因此这里不再声称「不改表结构」——表结构由上面的
+# SCHEMA + _migrate() 统一维护，本区块只负责读写逻辑
 
 
 def save_message(session_id, role, content, tool_name=None):
@@ -386,18 +444,177 @@ def add_profile(category, content, source="agent"):
         content：提炼后的一句话画像；
         source：来源，Agent 写入时默认 "agent"。
     返回：新插入画像的自增主键 id。
+    副作用：写 profiles 一行 + profile_history 一条（old_content 为 NULL）。
+
+    为什么插入也要记历史：只记「修改」的话，档案里会出现没有来历的行——
+    审计时无法区分「这条是冷启动灌进来的」和「Agent 在对话里新加的」。
+    首次创建的 old_content 显式留 NULL，正好一眼区分新建与修订。
+    """
+    with get_conn() as conn:
+        return _insert_profile(conn, category, content, source)
+
+
+def update_profile(profile_id, content, source="agent", user_id=USER_ID):
+    """修改一条画像的内容，刷新 updated_at 并留一条修订历史。
+
+    参数：
+        profile_id：目标画像主键；
+        content：新的画像内容（调用方负责 strip）；
+        source：本次修改的来源，默认 "agent"；
+        user_id：数据归属用户，默认本地单用户。
+    返回：更新后的整行 dict（含 category/content/created_at/updated_at）；
+        画像不存在或不属于该用户时返回 None，由上层翻译成 404。
+    副作用：写 profiles（content + updated_at）+ profile_history 一条旧→新记录。
+
+    关于 updated_at 为什么要应用层写：SQLite 没有 MySQL 那种
+    ON UPDATE CURRENT_TIMESTAMP 自动时间戳，只能显式赋值；
+    也不用触发器——触发器藏在数据库里，读代码的人看不见，
+    和本项目「逻辑全在代码里、注释能讲清」的目标相冲。
+
+    为什么先查旧值再改：修订历史必须记「改之前是什么」，
+    UPDATE 执行完就查不到旧值了；而且查不到行时直接返回 None，
+    不会误报成修改成功。
+    """
+    with get_conn() as conn:
+        old = conn.execute(
+            """
+            SELECT id, category, content
+            FROM profiles
+            WHERE id = ? AND user_id = ?
+            """,
+            (profile_id, user_id),
+        ).fetchone()
+        if old is None:
+            return None
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET content = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (content, now_iso(), profile_id, user_id),
+        )
+        # 历史与 UPDATE 共用同一个连接/事务：要么两笔都落，要么都不落，
+        # 不会出现「内容改了但历史没记上」的审计断点
+        _record_profile_history(
+            conn,
+            profile_id=profile_id,
+            category=old["category"],
+            old_content=old["content"],
+            new_content=content,
+            source=source,
+            user_id=user_id,
+        )
+        updated = conn.execute(
+            """
+            SELECT id, category, content, source, status, created_at, updated_at
+            FROM profiles
+            WHERE id = ? AND user_id = ?
+            """,
+            (profile_id, user_id),
+        ).fetchone()
+    return dict(updated)
+
+
+def replace_profiles_by_source(source, items, user_id=USER_ID):
+    """整批替换某个来源的画像（冷启动灌库脚本专用，单事务）。
+
+    参数：
+        source：本批画像的来源标记，同时也用来界定删除范围；
+        items：[(category, content), ...]，按给定顺序写入；
+        user_id：数据归属用户，默认本地单用户。
+    返回：{"deleted": 删除条数, "inserted": [{"id","category","content"}, ...]}。
+    副作用：删掉本来源的旧画像，写入新画像，并为每条新画像记一条创建历史。
+
+    为什么把这个操作放进 db.py（而不是让脚本自己 DELETE + INSERT）：
+    1) 写操作收口——脚本直接拼 DELETE/INSERT 就绕过了历史记录，
+       会出现「灌进来的画像没有历史行」的审计盲区；
+    2) 幂等灌库必须整体成功或整体失败，放在一个事务里才不会出现
+       「删了一半、插了一半」的长期记忆污染。
+
+    为什么不给删除动作补历史：删除对象是「本脚本上一轮写入的种子」，
+    这些内容在当初写入时就已各留了一条创建历史，内容本身没有丢；
+    再为批量重置单记删除会让历史表被整批噪音淹没（任务范围内也不要求）。
     """
     with get_conn() as conn:
         cursor = conn.execute(
-            """
-            INSERT INTO profiles (category, content, source, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'active', ?, ?)
-            """,
-            (category, content, source, now_iso(), now_iso()),
+            "DELETE FROM profiles WHERE source = ? AND user_id = ?",
+            (source, user_id),
         )
-        # 新画像默认 active 且创建/更新时间一致，
-        # 这样 V0 的 /api/profiles 和系统提示里的档案能立即看到
-        return cursor.lastrowid
+        deleted = cursor.rowcount
+
+        inserted = []
+        for category, content in items:
+            profile_id = _insert_profile(conn, category, content, source, user_id)
+            inserted.append(
+                {"id": profile_id, "category": category, "content": content}
+            )
+        return {"deleted": deleted, "inserted": inserted}
+
+
+def _insert_profile(conn, category, content, source, user_id=USER_ID):
+    """在调用方给定的事务里插入一条画像，并同步记一条创建历史。
+
+    参数：
+        conn：已打开的连接（由 add_profile / replace_profiles_by_source 传入）；
+        category：画像类别；
+        content：画像内容；
+        source：来源标记；
+        user_id：数据归属用户。
+    返回：新画像的自增主键 id。
+
+    为什么做成私有函数而不是公开的 db.add_profile：插入画像必须连同
+    历史行一起写，把「两笔写」封在同一个函数里，外部就不可能只写一半；
+    同时让批量灌库能复用同一套逻辑却仍然共享一个事务。
+    """
+    # created_at / updated_at 同一次取值：新建的画像还没被改过，
+    # 两个时间戳本来就该一致（/api/profiles 和系统提示立刻能看到）
+    timestamp = now_iso()
+    cursor = conn.execute(
+        """
+        INSERT INTO profiles (category, content, source, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'active', ?, ?)
+        """,
+        (category, content, source, timestamp, timestamp),
+    )
+    profile_id = cursor.lastrowid
+    _record_profile_history(
+        conn,
+        profile_id=profile_id,
+        category=category,
+        old_content=None,      # 首次创建没有「旧值」，历史里留 NULL 表示新建
+        new_content=content,
+        source=source,
+        user_id=user_id,
+    )
+    return profile_id
+
+
+def _record_profile_history(
+    conn, profile_id, category, old_content, new_content, source, user_id=USER_ID
+):
+    """写一条画像变更历史（内部函数，复用调用方的事务）。
+
+    参数：
+        conn：已打开的连接；
+        profile_id：画像主键；
+        category：画像类别；
+        old_content：变更前内容，首次创建传 None；
+        new_content：变更后内容；
+        source：来源标记（agent / seed 等）；
+        user_id：数据归属用户。
+    返回：无。
+    副作用：向 profile_history 插入一行。
+    """
+    conn.execute(
+        """
+        INSERT INTO profile_history
+            (profile_id, user_id, category, old_content, new_content, source, changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (profile_id, user_id, category, old_content, new_content, source, now_iso()),
+    )
 
 
 def upsert_journal(source, title, content, written_at):
