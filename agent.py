@@ -56,7 +56,9 @@ def run_chat(session_id, user_message):
     返回：{"reply": 最终回复文本,
           "tool_calls": 工具轨迹列表（旧字段，保持兼容）,
           "messages": 本轮最后一次发给模型的完整消息数组,
-          "trace": 按时间顺序的模型/工具混合时间线}。
+          "trace": 按时间顺序的模型/工具混合时间线,
+          "user_message_id"/"assistant_message_id": 本轮落库的消息主键,
+          前端拿它给气泡挂 id 锚点、给新记的笔记溯源}。
         工具轨迹元素为
         {"tool": 工具名, "args": 原始参数字符串, "result": 结果前 200 字}。
     """
@@ -64,8 +66,10 @@ def run_chat(session_id, user_message):
     #    历史在 memory.build_messages 中已过滤为 user/assistant
     messages = memory.build_messages(session_id, user_message)
 
-    # 2) 用户消息先落库；若后续 LLM 调用失败，问题也已在库里可追溯
-    db.save_message(session_id, "user", user_message)
+    # 2) 用户消息先落库；若后续 LLM 调用失败，问题也已在库里可追溯。
+    #    记下返回的 id：本轮若调用 create_note 记计划，计划要指向
+    #    「这条用户消息」，前端点击卡片才能跳回当前这轮对话
+    user_message_id = db.save_message(session_id, "user", user_message)
 
     # tool_calls：只记录“执行过的工具”，兼容旧前端；
     # trace：记录“模型每轮思考 + 工具执行”的完整先后关系，
@@ -117,8 +121,11 @@ def run_chat(session_id, user_message):
             )
 
             # dispatch 内部不抛异常：参数解析失败会返回错误文本，
-            # 模型读到 tool 消息里的错误后可在下一轮自我纠正
-            result = tools.dispatch(name, args)
+            # 模型读到 tool 消息里的错误后可在下一轮自我纠正。
+            # source_message_id 由这里注入（模型拿不到也猜不准主键）
+            result = tools.dispatch(
+                name, args, source_message_id=user_message_id
+            )
 
             # 轨迹截断到 200 字：既保留前端可视化需要的要点，
             # 又避免把整段日记原文塞进 HTTP 响应
@@ -158,7 +165,9 @@ def run_chat(session_id, user_message):
     # 4) 只把最终 assistant 回复落库；
     #    中间轮 assistant 消息 content 为 None 且带 tool_calls，
     #    不落库是避免历史里出现无法独立回放的残缺消息
-    db.save_message(session_id, "assistant", reply)
+    # 回复也要 id：前端给它挂锚点，同一次会话里「继续聊」后的消息
+    # 不必等刷新就能被计划卡片定位到
+    assistant_message_id = db.save_message(session_id, "assistant", reply)
 
     # 5) 把“实际发给模型”的消息列表转成纯 JSON 结构：
     #    这里处于循环出口，messages 正好是最后一次 chat_raw 的入参，
@@ -171,4 +180,6 @@ def run_chat(session_id, user_message):
         "tool_calls": tool_trace,
         "messages": jsonable_messages,
         "trace": trace,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
     }

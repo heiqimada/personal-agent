@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS notes (
     type TEXT NOT NULL,                  -- 类型：任务/愿望/想法/情绪/计划
     content TEXT NOT NULL,
     status TEXT DEFAULT 'open',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- 溯源字段：这条笔记由哪条 message 触发（用户当轮提问，= messages.id）。
+    -- 前端点计划卡片要能跳回「当时那轮对话」，没有它就只能干瞪眼；
+    -- 允许 NULL：V1 时代入库的老笔记没有来源，迁移后这些行保持 NULL
+    source_message_id INTEGER
 );
 
 -- messages：聊天记录（user / assistant / tool 三种角色）
@@ -87,11 +91,35 @@ def now_iso():
 
 
 def init_db():
-    """创建 data/agent.db（若不存在）并应用 V0 的建表语句。"""
+    """创建 data/agent.db（若不存在）、建表并补齐历史库缺失的列。"""
     # 说明：with 写法会提交事务但不会主动关闭连接；
     # SQLite 下短连接开销很低，本项目沿用这种简单写法
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """给已存在的老库补列（SQLite 的 CREATE TABLE IF NOT EXISTS 不会改旧表）。
+
+    参数：
+        conn：已打开的连接（由 init_db 传入，共用同一事务）。
+    返回：无。
+    副作用：必要时执行 ALTER TABLE ADD COLUMN（幂等，已存在则跳过）。
+
+    为什么必须显式迁移：老用户库里的 notes 表在 V5 之前就建好了，
+    重跑 SCHEMA 只会发现表已存在、直接跳过，source_message_id 永远不会出现，
+    接口一查就报 no such column。所以按「先查 PRAGMA 再决定加不加」的方式
+    做增量迁移，而且必须幂等——服务每次启动都会调 init_db()。
+
+    SQLite 的 ALTER TABLE ADD COLUMN 不需要重建表、不锁数据，
+    老行自动填 NULL，正好符合「历史计划无法溯源」的预期。
+    """
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(notes)").fetchall()
+    }
+    if "source_message_id" not in existing:
+        conn.execute("ALTER TABLE notes ADD COLUMN source_message_id INTEGER")
 
 
 # ===== V2：新增 CRUD 辅助函数（不改四张表 DDL，全部走既有表结构） =====
@@ -105,18 +133,24 @@ def save_message(session_id, role, content, tool_name=None):
         role：消息角色，user/assistant/tool 之一；
         content：消息正文；tool 消息存放工具返回文本；
         tool_name：仅 tool 消息使用，记录调用的是哪个工具。
-    返回：无（插入即提交）。
+    返回：新插入消息的自增主键 id（插入即提交）。
+
+    为什么要返回 id：Agent 在同一轮里可能调 create_note 记计划，
+    这条计划要回填 source_message_id 指向「当轮用户消息」，
+    拿不到 id 就没法建立溯源关系；返回 lastrowid 是最省事的做法，
+    不改表结构也不多查一次库。
     """
     # 时间戳统一走 now_iso()，保证与历史消息格式一致；
     # tool_name 传 None 时写入 NULL，不污染普通消息
     with get_conn() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO messages (session_id, role, content, tool_name, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             (session_id, role, content, tool_name, now_iso()),
         )
+        return cursor.lastrowid
 
 
 def recent_messages(session_id, limit):
@@ -201,6 +235,31 @@ def list_messages(session_id, user_id=USER_ID):
     return [dict(row) for row in rows]
 
 
+def get_message(message_id, user_id=USER_ID):
+    """按主键取单条消息（含会话 ID），供溯源跳转接口使用。
+
+    参数：
+        message_id：messages 表主键；
+        user_id：数据归属用户，默认本地单用户。
+    返回：{"id","session_id","role","content","tool_name","created_at"}；
+        不存在或不属于该用户时返回 None，由上层翻译成 404。
+
+    为什么要带 session_id 返回：前端点计划卡片时，如果目标消息不在
+    当前会话里，需要靠这个字段判断「是历史还没渲染完，还是跨会话了」，
+    否则只能瞎猜，会把用户引到错误的对话上。
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, session_id, role, content, tool_name, created_at
+            FROM messages
+            WHERE id = ? AND user_id = ?
+            """,
+            (message_id, user_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def list_active_profiles():
     """读取所有启用中的用户画像。
 
@@ -218,21 +277,29 @@ def list_active_profiles():
     return [dict(row) for row in rows]
 
 
-def add_note(note_type, content):
+def add_note(note_type, content, source_message_id=None):
     """写入一条 open 状态的笔记（待办/愿望/想法/情绪/计划等）。
 
     参数：
         note_type：笔记类型；
-        content：笔记内容。
+        content：笔记内容；
+        source_message_id：触发这条笔记的消息 id（通常是当轮用户消息），
+            默认 None 表示来源不明（非对话路径写入的笔记）。
     返回：新插入笔记的自增主键 id。
+
+    为什么来源由参数传入而不是在 SQL 里反查「最近一条消息」：
+    同一轮里模型可能连续调多次 create_note，反查只能拿到同一条最新消息；
+    而且并发会话下「最近一条」不可靠。由调用链上游（Agent 循环）把
+    明确的 id 传下来，来源才是确定的。
     """
     with get_conn() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO notes (user_id, type, content, status, created_at)
-            VALUES (?, ?, ?, 'open', ?)
+            INSERT INTO notes
+                (user_id, type, content, status, created_at, source_message_id)
+            VALUES (?, ?, ?, 'open', ?, ?)
             """,
-            (USER_ID, note_type, content, now_iso()),
+            (USER_ID, note_type, content, now_iso(), source_message_id),
         )
         return cursor.lastrowid  # 返回自增 id 便于前端/工具确认记录位置
 
@@ -243,17 +310,22 @@ def list_notes(status=None, user_id=USER_ID):
     参数：
         status：'open' / 'done'；传 None 表示不过滤（全部都要）；
         user_id：数据归属用户，默认本地单用户。
-    返回：元素为 {"id","type","content","status","created_at"} 的列表，
-        按 id 倒序（最新记录在最前）。
+    返回：元素为
+        {"id","type","content","status","created_at","source_message_id"}
+        的列表，按 id 倒序（最新记录在最前）。
 
     为什么要 status 过滤能力：前端需要在「全部 / 待办 / 已完成」之间切换，
     而下拉全量再在浏览器里筛会把无用的历史数据全塞进网络与内存；
     过滤下推到 SQL 里，配合 user_id 条件能直接走库内的行过滤。
+
+    为什么要把 source_message_id 带出去：前端靠它实现「点计划卡片
+    跳回那轮对话」，这个字段只在 notes 表里，接口不返回就断了链路。
     """
     # 状态与用户值一律走 ? 占位符；这里只按条件拼「结构」不拼「值」，
     # 因此不存在注入面（值永远由驱动转义后绑定）
     sql = (
-        "SELECT id, type, content, status, created_at FROM notes WHERE user_id = ?"
+        "SELECT id, type, content, status, created_at, source_message_id "
+        "FROM notes WHERE user_id = ?"
     )
     params = [user_id]
     if status:
@@ -273,8 +345,8 @@ def set_note_status(note_id, status, user_id=USER_ID):
         note_id：笔记主键 id；
         status：目标状态，只接受 'open' / 'done'（合法性由上层校验）；
         user_id：数据归属用户，默认本地单用户。
-    返回：更新后的 note dict（含 status 字段）；笔记不存在或不属于
-        该用户时返回 None，由上层翻译成 404。
+    返回：更新后的 note dict（含 status 与 source_message_id 字段）；
+        笔记不存在或不属于该用户时返回 None，由上层翻译成 404。
     副作用：写库（UPDATE notes）。
 
     为什么 UPDATE 的 WHERE 必须带 user_id：notes 表是多用户预留结构，
@@ -296,7 +368,7 @@ def set_note_status(note_id, status, user_id=USER_ID):
         )
         row = conn.execute(
             """
-            SELECT id, type, content, status, created_at
+            SELECT id, type, content, status, created_at, source_message_id
             FROM notes
             WHERE id = ? AND user_id = ?
             """,

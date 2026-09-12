@@ -7,6 +7,9 @@
   - 主区：聊天界面（POST /api/chat），Agent 回复带「思考过程」折叠区。
     打开页面时用 GET /api/messages 回填历史对话（刷新不丢上下文），
     回填期间锁住发送，避免新旧消息交错；
+  - 溯源跳转（V6）：点侧边栏卡片定位到产生这条记录的那轮对话
+    （每条气泡挂 id="msg-{message_id}" 锚点），目标消息闪 3 下高亮；
+    没有来源（老数据）或跨会话的记录会给出明确提示，不做假跳转。
   - 不引入任何框架与 CDN：样式和脚本全部内联，离线也能打开页面。
 -->
 <html lang="zh-CN">
@@ -142,6 +145,14 @@
       border-radius: var(--radius);
       padding: 10px 12px;
       word-break: break-word;
+      /* 卡片整体可点（跳回产生这条计划的对话）：光标给出手感，
+       * transition + hover 变色提示「这里能点」，否则用户不知道有这个能力 */
+      cursor: pointer;
+      transition: border-color 0.15s ease;
+    }
+
+    .todo-item:hover {
+      border-color: var(--primary);
     }
 
     /* 已完成条目整体置灰：状态一眼可辨，但条目不删除，保留可追溯性 */
@@ -326,6 +337,23 @@
       flex-direction: column;
       align-items: flex-start;
       gap: 8px;
+    }
+
+    /*
+     * 溯源跳转的闪烁高亮：点计划卡片跳到某条消息时闪 3 下。
+     * 用 CSS @keyframes 而不是 JS 定时器改样式——动画交给合成器跑，
+     * 不占主线程，也不会因为 setTimeout 叠加产生抖动；
+     * 动画次数写死 3 次（任务要求的「闪烁 3 次」），结束后由 JS 监听
+     * animationend 摘掉类名，下次点击才能重新触发同一段动画。
+     */
+    @keyframes flash-message {
+      0%, 100% { background-color: transparent; }
+      50%      { background-color: #fff3b0; }
+    }
+
+    .message.flash-target {
+      animation: flash-message 0.45s ease-in-out 3;
+      border-radius: var(--radius);
     }
 
     /* 思考过程折叠区：默认收起，需要时再展开，不打断阅读流 */
@@ -901,6 +929,17 @@
 
         card.appendChild(top);
         card.appendChild(body);
+        // 溯源跳转：整张卡片可点，但勾选框/时间等控件上的点击要放行，
+        // 否则用户想勾完成会连带跳到对话区，操作被打断
+        card.title = item.source_message_id
+          ? "点击定位到产生这条记录的那轮对话"
+          : "该记录没有溯源信息";
+        card.addEventListener("click", function (event) {
+          if (event.target.closest(".todo-check")) {
+            return;  // 点在勾选框上 = 改状态，不是跳转
+          }
+          jumpToSource(item);
+        });
         fragment.appendChild(card);
       });
       todoListEl.replaceChildren(fragment);
@@ -972,21 +1011,50 @@
 
     /**
      * 渲染一条用户消息（靠右蓝气泡）。
+     * 参数：
+     *   text：气泡正文；
+     *   messageId：该消息在 messages 表的主键，可选；
+     *       传了就挂成 DOM 锚点 id="msg-{id}"，计划卡片才能定位到它。
+     * 返回：新建的消息节点（发送方拿它回填后到的 message_id）。
      */
-    function appendUserMessage(text) {
+    function appendUserMessage(text, messageId) {
       const wrapper = createEl("div", "message user");
+      applyMessageAnchor(wrapper, messageId);
       wrapper.appendChild(createEl("div", "bubble", text));
       messagesEl.appendChild(wrapper);
       scrollToBottom();
+      return wrapper;
+    }
+
+    /**
+     * 给消息节点挂锚点 id（没有 id 就什么都不做）。
+     * 参数：
+     *   node：消息最外层节点；
+     *   messageId：messages 表主键，可为 undefined/null。
+     * 返回值：无。
+     * 副作用：写 node.id。
+     *
+     * 为什么统一走这个函数：历史渲染、在线渲染、用户/助手三条路径
+     * 都要挂锚点，锚点格式必须完全一致（就是 msg-{id}），
+     * 散落各处手写字符串迟早会出现 msg-{id} 和 message-{id} 两种写法，
+     * 跳转就找不到节点了。
+     */
+    function applyMessageAnchor(node, messageId) {
+      if (messageId === undefined || messageId === null || messageId === "") {
+        return;
+      }
+      node.id = "msg-" + messageId;
     }
 
     /**
      * 渲染一条 Agent 回复：正文气泡 + 下方「思考过程」折叠区。
      * trace 是新的逐轮时间线；tool_calls/messages 缺失时兼容旧后端；
      * messages 为本轮实际发给模型的完整上下文，缺失时不渲染调试块。
+     * messageId 为后端返回的消息主键，用于挂锚点（可选）。
      */
-    function appendAgentMessage(content, toolCalls, messages, trace) {
+    function appendAgentMessage(content, toolCalls, messages, trace, messageId) {
       const wrapper = createEl("div", "message agent");
+      applyMessageAnchor(wrapper, messageId);
       const body = createEl("div", "message agent-body");
       const text = (content || "").trim();
       body.appendChild(
@@ -1018,6 +1086,8 @@
      */
     function appendHistoryAgentMessage(message) {
       const wrapper = createEl("div", "message agent");
+      // 历史消息一律带 id，计划卡片靠它 scrollIntoView 定位
+      applyMessageAnchor(wrapper, message.id);
       const body = createEl("div", "message agent-body");
       // content 为空的历史行（例如只调了工具但回复没落库）用占位文案兜底，
       // 否则气泡会渲染成一片空白，用户以为页面坏了
@@ -1087,7 +1157,8 @@
       messagesEl.replaceChildren();
       messages.forEach(function (message) {
         if (message.role === "user") {
-          appendUserMessage(message.content || "（空消息）");
+          // 带上 message.id：渲染完对话区里就有 msg-{id} 锚点可供跳转
+          appendUserMessage(message.content || "（空消息）", message.id);
         } else {
           appendHistoryAgentMessage(message);
         }
@@ -1157,6 +1228,129 @@
       } finally {
         isLoadingHistory = false;
         sendButtonEl.disabled = busy;
+      }
+    }
+
+    // ===== V6：计划卡片溯源跳转（点卡片 → 定位到产生它的那条消息） =====
+
+    /**
+     * 查单条消息（GET /api/messages/{id}）。
+     * 参数：messageId——messages 表主键。
+     * 返回：消息对象（含 session_id/role/content）；后端 404 时返回 null。
+     * 异常：网络错误或 5xx 抛出，由调用方 toast。
+     *
+     * 为什么 404 不当异常抛：计划指向的消息可能被清理掉了，
+     * 「查无此消息」是需要如实告诉用户的业务分支，不是程序错误，
+     * 混进 catch 里会被当成「网络挂了」，提示就误导了。
+     */
+    async function fetchMessage(messageId) {
+      const response = await fetch(
+        "/api/messages/" + encodeURIComponent(messageId)
+      );
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+      }
+      return await response.json();
+    }
+
+    /**
+     * 给目标消息做闪烁高亮（CSS 动画闪 3 次后自动恢复）。
+     * 参数：node——消息最外层节点。
+     * 返回值：无。
+     * 副作用：加 .flash-target 类，动画播完自动摘除。
+     *
+     * 为什么用 animationend 摘类名而不是 setTimeout：
+     * 定时器要自己算动画时长（次数×单次时长），以后改 CSS 就得同步改 JS，
+     * 容易不同步；animationend 由浏览器在真正播完时派发，
+     * 摘掉后下次点击还能重新触发同一段动画。
+     */
+    function flashMessage(node) {
+      node.classList.remove("flash-target");  // 连续点同一条时先复位
+      // 强制读一次布局：让浏览器确认类名已摘掉；
+      // 否则紧接着的 add 会与 remove 合并成一次变更，动画不会重播
+      void node.offsetWidth;
+      node.classList.add("flash-target");
+      node.addEventListener("animationend", function handler() {
+        node.classList.remove("flash-target");
+        node.removeEventListener("animationend", handler);
+      });
+    }
+
+    /**
+     * 把对话区滚到目标消息并高亮。
+     * 参数：node——目标消息节点。
+     * 返回值：无。副作用：滚动对话区 + 触发高亮动画。
+     *
+     * block:'center' 让目标停在可视区中间（贴边容易被误认为没滚到位），
+     * smooth 让用户看清是从当前位置滚过去的，不至于「瞬移」后失去方位感。
+     */
+    function scrollAndFlash(node) {
+      node.scrollIntoView({ behavior: "smooth", block: "center" });
+      flashMessage(node);
+    }
+
+    /**
+     * 点计划卡片的入口：定位到产生这条记录的对话消息。
+     * 参数：item——侧边栏 note 对象，需带 source_message_id。
+     * 返回值：无（异步过程）。
+     * 副作用：滚动/高亮对话区，必要时弹 toast。
+     *
+     * 兜底顺序：
+     * 1) 没有 source_message_id（V6 之前入库的历史记录）→ 直接提示无溯源；
+     * 2) 对话区里已有锚点 → 滚过去高亮，这是主路径；
+     * 3) 没有锚点 → 查一次消息：确认它存在、并看它属于哪个会话，
+     *    再决定是「等历史渲染完重试」还是「跨会话、暂不支持」。
+     *
+     * TODO: 跨会话跳转。计划卡片的来源消息可能属于别的 session
+     * （换过浏览器/清过缓存后新建的会话），要真正跳过去得先按
+     * 目标 message.session_id 拉那一段历史再定位；当前版本先如实提示，
+     * 不做「把用户丢到错误对话里」的假跳转。
+     */
+    async function jumpToSource(item) {
+      const messageId = item.source_message_id;
+      if (!messageId) {
+        showToast("该计划无溯源记录", "error");
+        return;
+      }
+
+      const existing = document.getElementById("msg-" + messageId);
+      if (existing) {
+        scrollAndFlash(existing);
+        return;
+      }
+
+      try {
+        const message = await fetchMessage(messageId);
+        if (!message) {
+          showToast("溯源消息已不存在", "error");
+          return;
+        }
+        // 当前会话以 getSessionId() 为准：新消息都发往它，
+        // 对话区展示的也是它（loadHistory 认领会话后已写回 localStorage）。
+        // 目标消息不属于它 = 跨会话，当前版本不做假跳转
+        if (message.session_id !== getSessionId()) {
+          showToast("该记录来自其他会话，跨会话跳转暂未支持", "error");
+          return;
+        }
+        // 同会话却找不到节点：多半是启动时历史还在渲染，
+        // 隔一小段重试几次即可；不用轮询死等，避免历史加载失败时一直转圈
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await new Promise(function (resolve) {
+            setTimeout(resolve, 120);
+          });
+          const node = document.getElementById("msg-" + messageId);
+          if (node) {
+            scrollAndFlash(node);
+            return;
+          }
+        }
+        showToast("没能定位到那条消息，刷新页面再试", "error");
+      } catch (error) {
+        console.error("溯源跳转失败：", error);
+        showToast("定位失败，请稍后再试", "error");
       }
     }
 
@@ -1411,7 +1605,8 @@
       setBusy(true);
       messageInputEl.value = "";
       autoResizeInput();
-      appendUserMessage(text);
+      // 先渲染用户气泡（不能等网络），拿到节点引用以便稍后回填消息 id 锚点
+      const userNode = appendUserMessage(text);
 
       try {
         const response = await fetch("/api/chat", {
@@ -1441,11 +1636,16 @@
           throw new Error("请求失败（HTTP " + response.status + "）");
         }
 
+        // 本轮两条消息的 id 只有后端落库后才知道，气泡却是先画的，
+        // 所以在这里补锚点：补完当前这轮对话也能被计划卡片直接跳转，
+        // 不必刷新页面等历史渲染
+        applyMessageAnchor(userNode, data.user_message_id);
         appendAgentMessage(
           data.reply,
           data.tool_calls,
           data.messages,
-          data.trace
+          data.trace,
+          data.assistant_message_id
         );
         // Agent 可能刚通过 create_note 写了新待办，刷新侧边栏保持一致
         await loadTodos();

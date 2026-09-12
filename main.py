@@ -9,6 +9,9 @@ V4：待办勾选完成——GET /api/notes 支持 status 过滤并返回 status
     新增 PATCH /api/notes/{id}/status 让前端把待办勾成 done / 取消回 open。
 V5：刷新恢复上下文——新增 GET /api/messages，前端打开页面就把
     最近一次会话的历史对话回填到对话区，不用从头聊。
+V6：计划卡片溯源跳转——notes 表加 source_message_id 记录来源消息，
+    新增 GET /api/messages/{id} 供前端定位；/api/chat 顺带回传本轮
+    user/assistant 的消息 id，前端给气泡挂锚点、点卡片即可跳+高亮。
 """
 
 from contextlib import asynccontextmanager
@@ -228,6 +231,33 @@ def get_messages(session_id: Optional[str] = None):
     return {"session_id": target, "messages": _group_history(rows)}
 
 
+# ===== V6 新增：GET /api/messages/{id}（计划卡片溯源跳转用） =====
+@app.get("/api/messages/{message_id}")
+def get_message(message_id: int):
+    """按主键取单条消息，前端点计划卡片时用它确认目标并拿 session_id。
+
+    参数：
+        message_id：路径参数，messages 表主键。
+    返回：{"id","session_id","role","content","tool_name","created_at"}。
+    副作用：无（只读）。
+    异常：该 id 不存在（或不属于当前用户）→ 404。
+
+    为什么跳转还需要单查一条消息：计划卡片只存了 source_message_id，
+    而目标消息可能不在当前已渲染的会话里（用户换了会话、或历史还没加载完）。
+    前端靠这次查询拿到 session_id，才能区分「同一个会话、DOM 还没渲染」
+    和「跨会话、当前不支持跳转」两种情况，给出不同提示而不是瞎滚。
+
+    注意路由顺序：本路由必须注册在静态目录挂载之前，否则会被 StaticFiles
+    吃掉（/api/messages/{id} 不匹配任何静态文件，但保持 API 在前更稳妥）。
+    """
+    message = db.get_message(message_id)
+    if message is None:
+        # 和 /api/notes/{id}/status 一致：查不到就 404，不返回空对象，
+        # 否则前端会把「没这条消息」当成「拿到了空内容」照常跳转
+        raise HTTPException(status_code=404, detail="消息不存在")
+    return message
+
+
 # ===== 请求体模型 =====
 class ImportPayload(BaseModel):
     """POST /api/import 的请求体。"""
@@ -289,6 +319,10 @@ def chat(payload: ChatPayload):
         "tool_calls": result["tool_calls"],  # 完整轨迹：工具/参数/结果前200字
         "messages": result["messages"],  # 本轮发给模型的完整上下文（调试视图）
         "trace": result["trace"],  # 模型思考+工具执行的逐轮时间线
+        # 本轮两条消息的主键：前端给气泡挂 id 锚点（历史渲染走
+        # /api/messages），新记的计划靠 user_message_id 溯源到这条提问
+        "user_message_id": result["user_message_id"],
+        "assistant_message_id": result["assistant_message_id"],
     }
 
 

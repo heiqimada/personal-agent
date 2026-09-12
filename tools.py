@@ -66,13 +66,18 @@ def search_journal(query):
     return "\n\n".join(lines)
 
 
-def create_note(note_type, content):
+def create_note(note_type, content, source_message_id=None):
     """把用户要记住的内容写入笔记表，返回确认文本。
 
     参数：
         note_type：类型，限 task/wish/idea/emotion/plan；
-        content：笔记正文。
+        content：笔记正文；
+        source_message_id：触发这条笔记的消息 id，由 Agent 循环注入
+            （见 dispatch 的说明），默认 None 表示来源不明。
     返回：确认文本（含新 id）；类型不合法时返回错误说明。
+
+    为什么要带来源：这条笔记以后要支持「点卡片跳回当时那轮对话」，
+    入库时不留下来源，事后无论怎么查都补不回来（消息表里没有反查索引）。
     """
     allowed = {"task", "wish", "idea", "emotion", "plan"}
     if note_type not in allowed:
@@ -86,9 +91,15 @@ def create_note(note_type, content):
         )
     if not content or not str(content).strip():
         return "笔记内容不能为空"
-    new_id = db.add_note(note_type, str(content).strip())
+    new_id = db.add_note(
+        note_type, str(content).strip(), source_message_id=source_message_id
+    )
     # 控制台打印落库结果，方便人工核对 Agent 行为
-    print("[tool] create_note id={} type={}".format(new_id, note_type))
+    print(
+        "[tool] create_note id={} type={} from_msg={}".format(
+            new_id, note_type, source_message_id
+        )
+    )
     return "已记录（id={}，类型={}）：{}".format(new_id, note_type, content)
 
 
@@ -214,14 +225,21 @@ TOOLS = [
 ]
 
 
-def dispatch(name, arguments_json):
+def dispatch(name, arguments_json, source_message_id=None):
     """按工具名把 JSON 参数分发给对应工具函数。
 
     参数：
         name：模型请求的工具名；
-        arguments_json：OpenAI 返回的参数字符串（JSON 文本）。
+        arguments_json：OpenAI 返回的参数字符串（JSON 文本）；
+        source_message_id：本轮用户消息 id，由 Agent 循环注入，
+            只给 create_note 用于溯源（其它工具忽略）。
     返回：工具结果的文本；解析失败或工具名未知时返回错误文本
         （不抛异常，错误会作为 tool 消息回传给模型自我纠正）。
+
+    为什么 source_message_id 走函数参数、而不是写进 TOOLS 的 schema：
+    schema 是给模型看的，模型并不知道数据库主键是什么，一旦让它填，
+    它只会编一个看起来像的数字，溯源反而变成假数据。真实来源只有
+    Agent 循环（知道刚插入的 user 消息 id）才拿得到，所以从这一层注入。
     """
     try:
         # 模型偶尔会生成不完整 JSON，必须容错解析：
@@ -243,7 +261,11 @@ def dispatch(name, arguments_json):
         content = args.get("content")
         if note_type is None or content is None:
             return "缺少参数 note_type 或 content"
-        return create_note(str(note_type), str(content))
+        # 即使模型自作主张在 args 里塞了 source_message_id 也不采信：
+        # 只认 Agent 循环注入的权威值（None 就如实存 NULL，不猜）
+        return create_note(
+            str(note_type), str(content), source_message_id=source_message_id
+        )
 
     if name == "save_profile":
         category = args.get("category")
