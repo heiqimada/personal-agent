@@ -7,6 +7,8 @@ V2：/api/chat 从“焊死 RAG 检索”改为 Agent 多轮工具调用循环�
 V3：把 static/index.html 挂到根路径，访问 / 直接打开可视化前端。
 V4：待办勾选完成——GET /api/notes 支持 status 过滤并返回 status 字段，
     新增 PATCH /api/notes/{id}/status 让前端把待办勾成 done / 取消回 open。
+V5：刷新恢复上下文——新增 GET /api/messages，前端打开页面就把
+    最近一次会话的历史对话回填到对话区，不用从头聊。
 """
 
 from contextlib import asynccontextmanager
@@ -126,6 +128,104 @@ def update_note_status(note_id: int, payload: NoteStatusPayload):
         # 不能返回 200 空对象，否则前端会把「没改成」当成「改成功了」
         raise HTTPException(status_code=404, detail="笔记不存在")
     return note
+
+
+def _group_history(rows):
+    """把消息行归并成前端渲染单元（用户/助手两条气泡 + 助手侧的工具轨迹）。
+
+    参数：
+        rows：db.list_messages 返回的行列表，按 id 正序，可能混有 role='tool'。
+    返回：列表，元素为
+        {"id","role","content","created_at"}；
+        role='assistant' 的元素额外带 "tool_calls"（本轮工具轨迹）与
+        "process_recorded"（本轮是否有工具过程记录）。
+
+    为什么要在后端归并而不是原样吐给前端：
+    1) role='tool' 的行是「过程」，不是对话气泡，直接渲染会让对话区
+       混进工具原文；
+    2) agent.py 的落库顺序是 user → tool… → assistant（工具结果先于
+       最终回复入库），所以把 tool 行挂到「紧随其后的那条 assistant」
+       上，恰好还原成本轮的真实过程；
+    3) 前端渲染逻辑因此不必了解 role=tool 的存在，容错更简单。
+
+    坑点：待办/画像类工具一轮可能存多条 tool 行，全部归到同一条
+    assistant 回复下，前端按调用顺序逐张渲染卡片即可。
+
+    TODO: 补存工具调用过程。messages 表当前只存 assistant 的最终回复
+    与 tool 结果文本，模型逐轮思考（trace）和 tool_calls 参数（args）
+    都没有入库，所以刷新后只能还原「工具名 + 返回内容」，
+    参数与逐轮时间线无法回放；要完整回放就得给 messages 表加
+    过程字段（或单独建 trace 表），本次先按「有多少还原多少」处理。
+    """
+    grouped = []
+    pending_tools = []  # 尚未归属到某条 assistant 回复的工具过程
+
+    for row in rows:
+        role = row.get("role")
+        if role == "tool":
+            pending_tools.append(
+                {
+                    "tool": row.get("tool_name") or "unknown_tool",
+                    # args 没入库，用固定文案占位而不是编造内容
+                    "args": "（未记录）",
+                    "result": row.get("content") or "",
+                }
+            )
+            continue
+
+        if role == "assistant":
+            # 工具过程挂在紧随其后的 assistant 回复上，与真实发生顺序一致
+            grouped.append(
+                {
+                    "id": row.get("id"),
+                    "role": role,
+                    "content": row.get("content"),
+                    "created_at": row.get("created_at"),
+                    "tool_calls": pending_tools,
+                    "process_recorded": bool(pending_tools),
+                }
+            )
+            pending_tools = []
+            continue
+
+        # 剩下的只有 user。若这里还挂着工具过程，说明上一轮 assistant
+        # 回复没落库（进程被中断等异常历史），这些过程无法归属，丢弃即可：
+        # 硬塞给下一条回复会造成「张冠李戴」的假回放
+        pending_tools = []
+        grouped.append(
+            {
+                "id": row.get("id"),
+                "role": role,
+                "content": row.get("content"),
+                "created_at": row.get("created_at"),
+            }
+        )
+    return grouped
+
+
+# ===== V5 新增：GET /api/messages（刷新后回填历史对话） =====
+@app.get("/api/messages")
+def get_messages(session_id: Optional[str] = None):
+    """返回某会话的历史消息，前端打开页面时用它回填对话区。
+
+    参数：
+        session_id：可选。传了就取该会话；不传则退化为
+            「最近一次有消息的会话」（前端换浏览器/清缓存后的兜底路径）。
+    返回：{"session_id": 实际使用的会话 ID（空库时为空串）,
+          "messages": 按时间正序（旧→新）的渲染单元列表}。
+        每条含 role/content/created_at/id；assistant 条目额外带
+        tool_calls 与 process_recorded（见 _group_history）。
+    副作用：无（只读）。
+    """
+    # 传了 session_id 就严格按它查，即使查出来是空的也不偷偷换成别的会话：
+    # 「这个会话没消息」和「给你换个会话」是两种语义，静默替换会让前端
+    # 把新消息写进另一个会话里而用户毫不知情；要兜底由前端显式再调一次
+    target = (session_id or "").strip()
+    if not target:
+        target = db.latest_session_id() or ""
+
+    rows = db.list_messages(target) if target else []
+    return {"session_id": target, "messages": _group_history(rows)}
 
 
 # ===== 请求体模型 =====

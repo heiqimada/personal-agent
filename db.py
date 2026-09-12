@@ -149,6 +149,58 @@ def recent_messages(session_id, limit):
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
 
+def latest_session_id(user_id=USER_ID):
+    """取最近有过消息的会话 ID（按 messages.id 倒序取第一条）。
+
+    参数：
+        user_id：数据归属用户，默认本地单用户。
+    返回：session_id 字符串；messages 表里一条消息都没有时返回 None。
+
+    为什么要这个函数：前端只把 session_id 存在浏览器 localStorage 里，
+    换浏览器/清缓存后它不知道自己上次聊的是哪个会话；接口不传
+    session_id 时就靠这里兜底，保证「刷新后至少能看到最近一次对话」。
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT session_id
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    return row["session_id"] if row is not None else None
+
+
+def list_messages(session_id, user_id=USER_ID):
+    """按时间正序取某会话的全部消息行（含 role='tool' 的过程行）。
+
+    参数：
+        session_id：会话 ID；
+        user_id：数据归属用户，默认本地单用户。
+    返回：元素为 {"id","role","content","tool_name","created_at"} 的列表，
+        按 id 正序（旧→新，也就是对话发生的真实顺序）。
+
+    为什么把 role='tool' 的行也取出来：这些行不会进 LLM 上下文
+    （见 memory.py 的红线），但它们是「本轮到底调了什么工具、
+    工具返回了什么」的唯一持久化证据；刷新页面回填时丢掉了就没法回放，
+    所以 db 层照取，由上层决定怎么归并展示。
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, role, content, tool_name, created_at
+            FROM messages
+            WHERE session_id = ? AND user_id = ?
+            ORDER BY id
+            """,
+            (session_id, user_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def list_active_profiles():
     """读取所有启用中的用户画像。
 

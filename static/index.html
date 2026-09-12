@@ -5,6 +5,8 @@
     （PATCH /api/notes/{id}/status）与「全部/待办/已完成」筛选；
     勾选采用乐观更新，失败回滚并 toast 提示；
   - 主区：聊天界面（POST /api/chat），Agent 回复带「思考过程」折叠区。
+    打开页面时用 GET /api/messages 回填历史对话（刷新不丢上下文），
+    回填期间锁住发送，避免新旧消息交错；
   - 不引入任何框架与 CDN：样式和脚本全部内联，离线也能打开页面。
 -->
 <html lang="zh-CN">
@@ -715,6 +717,11 @@
     // 是否正在等后端：防止用户连续发送导致上下文/状态错乱
     let busy = false;
 
+    // 是否正在回填历史对话：拉历史期间必须挡住发送，
+    // 否则「回填的旧消息」和「刚发的新消息」会交错 append，
+    // 对话区顺序对不上，用户会以为消息丢了或重复了
+    let isLoadingHistory = false;
+
     // 当前待办筛选：'all' / 'open' / 'done'，与 .filter-button 的 data-filter 一致。
     // 只存这一份状态，渲染时按需拼查询参数，避免筛选状态散落在 DOM 里
     let todoFilter = "all";
@@ -758,6 +765,28 @@
         }
       }
       return sessionId;
+    }
+
+    /**
+     * 把会话 ID 写进 localStorage，保证后续刷新都落到同一个会话上。
+     * 参数：sessionId——服务端确认过的会话 ID（空值直接忽略）。
+     * 返回值：无。
+     * 副作用：写 localStorage（隐私模式下会抛异常，只告警不中断）。
+     *
+     * 为什么要覆盖写入：回填历史时若发现本浏览器没有消息、而服务端
+     * 返回了「最近一次会话」，就得把会话认下来；不写回的话，
+     * 每次刷新都会先拿一个空会话白查一次，还会留下一个永远没消息的
+     * 幽灵 session_id。
+     */
+    function setSessionId(sessionId) {
+      if (!sessionId) {
+        return;
+      }
+      try {
+        localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+      } catch (error) {
+        console.warn("无法写入 localStorage，本次会话不持久化：", error);
+      }
     }
 
     /**
@@ -973,6 +1002,162 @@
       wrapper.appendChild(body);
       messagesEl.appendChild(wrapper);
       scrollToBottom();
+    }
+
+    /**
+     * 渲染一条历史里的 Agent 回复（不含逐轮 trace，因为没入库）。
+     * 参数：message——GET /api/messages 返回的 assistant 渲染单元，
+     *   可能带 tool_calls（仅工具名+返回内容）。
+     * 返回值：无。
+     * 副作用：向对话区追加节点。
+     *
+     * 为什么单独一个函数：历史消息只能还原「工具调用」这一层，
+     * 不能复用在线渲染（那个带 trace/messages 调试块）。
+     * 过程缺失时必须给出明确占位文案，而不是显示成「本轮未调用工具」——
+     * 后者会让用户以为 Agent 当时真的没查日记，属于误导。
+     */
+    function appendHistoryAgentMessage(message) {
+      const wrapper = createEl("div", "message agent");
+      const body = createEl("div", "message agent-body");
+      // content 为空的历史行（例如只调了工具但回复没落库）用占位文案兜底，
+      // 否则气泡会渲染成一片空白，用户以为页面坏了
+      const text = (message.content || "").trim();
+      body.appendChild(createEl("div", "bubble", text || "[过程未记录]"));
+
+      const details = createEl("details", "thinking");
+      details.appendChild(createEl("summary", "", "🧠 思考过程"));
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (toolCalls.length > 0) {
+        const container = createEl("div", "tool-cards");
+        toolCalls.forEach(function (toolCall) {
+          container.appendChild(buildToolCard(toolCall));
+        });
+        details.appendChild(container);
+        details.appendChild(
+          createEl(
+            "div",
+            "no-tools",
+            "（历史消息：仅还原工具调用，模型逐轮思考与参数未入库）"
+          )
+        );
+      } else {
+        details.appendChild(
+          createEl("div", "no-tools", "（历史消息：本轮未记录工具调用）")
+        );
+      }
+      body.appendChild(details);
+      wrapper.appendChild(body);
+      messagesEl.appendChild(wrapper);
+    }
+
+    /**
+     * 拉取历史消息（GET /api/messages）。
+     * 参数：sessionId——会话 ID；传空串表示不传参，
+     *   由服务端返回「最近一次有消息的会话」。
+     * 返回：{"session_id": 字符串, "messages": 数组}；
+     *   字段缺失时降级成空值，保证调用方不用做空值判断。
+     * 异常：HTTP 非 2xx 时抛错，由调用方决定怎么提示。
+     */
+    async function fetchHistory(sessionId) {
+      const query = sessionId
+        ? "?session_id=" + encodeURIComponent(sessionId)
+        : "";
+      const response = await fetch("/api/messages" + query);
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+      }
+      const data = await response.json();
+      return {
+        session_id: data && data.session_id ? data.session_id : "",
+        messages: data && Array.isArray(data.messages) ? data.messages : []
+      };
+    }
+
+    /**
+     * 把历史消息按「旧→新」渲染进对话区。
+     * 参数：messages——fetchHistory 返回的正序渲染单元数组。
+     * 返回值：无。
+     * 副作用：清空对话区（含首屏欢迎语）后整体重绘，最后滚到最新一条。
+     *
+     * 为什么先 replaceChildren 整体重绘而不是逐条 append：
+     * 欢迎语是首屏写死的节点，逐条 append 会把历史对话接在它后面，
+     * 出现「你好，我是你的个人 AI 助手」夹在真实对话中间的错觉。
+     */
+    function renderHistory(messages) {
+      messagesEl.replaceChildren();
+      messages.forEach(function (message) {
+        if (message.role === "user") {
+          appendUserMessage(message.content || "（空消息）");
+        } else {
+          appendHistoryAgentMessage(message);
+        }
+      });
+      scrollToBottom();
+    }
+
+    /**
+     * 首屏欢迎语：只在「没有任何历史对话」时显示。
+     * 有历史时对话区由 renderHistory 整体替换，不会再插这条欢迎语。
+     */
+    function showWelcomeMessage() {
+      const welcome = createEl("div", "message agent");
+      const welcomeBody = createEl("div", "message agent-body");
+      welcomeBody.appendChild(
+        createEl(
+          "div",
+          "bubble",
+          "你好，我是你的个人 AI 助手。可以问我关于日记的问题，也可以说“提醒我……”让我帮你记下待办。"
+        )
+      );
+      welcome.appendChild(welcomeBody);
+      messagesEl.appendChild(welcome);
+    }
+
+    /**
+     * 打开页面时回填历史对话。
+     * 参数：无。
+     * 返回值：无（异步过程）。
+     * 副作用：可能调用 setSessionId 认领服务端返回的会话；
+     *   成功后重绘对话区，失败时保留欢迎语并弹 toast。
+     *
+     * 兜底顺序：先按本浏览器的 session_id 查，空了再查「最近一次会话」。
+     * 为什么要有第二层：session_id 存在 localStorage，换浏览器或清缓存
+     * 之后就找不到自己的会话了；不兜底的话用户打开页面还是空白，
+     * 「刷新恢复上下文」这个需求就没真正满足。
+     */
+    async function loadHistory() {
+      if (isLoadingHistory) {
+        return;
+      }
+      isLoadingHistory = true;
+      // 拉历史期间禁用发送按钮（输入框不禁用，用户可以先打字）；
+      // 解锁时必须还原成 busy 的真实状态，否则会把「正在等 LLM 回复」
+      // 误判成空闲、放行并发发送
+      sendButtonEl.disabled = true;
+      try {
+        let data = await fetchHistory(getSessionId());
+        if (data.messages.length === 0) {
+          const fallback = await fetchHistory("");
+          if (fallback.messages.length > 0) {
+            data = fallback;
+          }
+        }
+        // 认领服务端确认的会话 ID，下次刷新直接命中，不再白查一次
+        setSessionId(data.session_id);
+        if (data.messages.length > 0) {
+          renderHistory(data.messages);
+        } else {
+          showWelcomeMessage();
+        }
+      } catch (error) {
+        console.error("历史对话加载失败：", error);
+        // 回填失败不阻断聊天：给欢迎语让页面可用，再提示一句原因
+        showWelcomeMessage();
+        showToast("历史对话没加载出来，可以直接继续聊", "error");
+      } finally {
+        isLoadingHistory = false;
+        sendButtonEl.disabled = busy;
+      }
     }
 
     /**
@@ -1217,7 +1402,9 @@
      */
     async function sendMessage() {
       const text = messageInputEl.value.trim();
-      if (!text || busy) {
+      // isLoadingHistory 期间直接不发：历史还没渲染完，先发会把新问答
+      // 插到旧消息前面（顺序错乱）。输入框内容保留，回填完成后可再点发送
+      if (!text || busy || isLoadingHistory) {
         return;
       }
 
@@ -1315,20 +1502,10 @@
       loadTodos();
     });
 
-    // 首屏欢迎语放在真实对话之外，不用“思考过程”模板
-    const welcome = createEl("div", "message agent");
-    const welcomeBody = createEl("div", "message agent-body");
-    welcomeBody.appendChild(
-      createEl(
-        "div",
-        "bubble",
-        "你好，我是你的个人 AI 助手。可以问我关于日记的问题，也可以说“提醒我……”让我帮你记下待办。"
-      )
-    );
-    welcome.appendChild(welcomeBody);
-    messagesEl.appendChild(welcome);
-
-    // 页面打开就加载待办；之后由发送按钮/手动刷新维护
+    // 页面打开：先回填历史对话（有历史就不显示欢迎语），再加载待办。
+    // 两个请求互不依赖，但必须分开写：loadHistory 内部有发送锁，
+    // 把待办请求塞进同一个 try 会让待办失败连带影响历史回填的提示
+    loadHistory();
     loadTodos();
   </script>
 </body>
