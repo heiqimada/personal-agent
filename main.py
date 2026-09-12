@@ -5,10 +5,13 @@ V1：/api/import 导入日记并建向量索引（原样保留）；
 V2：/api/chat 从“焊死 RAG 检索”改为 Agent 多轮工具调用循环，
     并新增 GET /api/notes 供前端展示 open 笔记。
 V3：把 static/index.html 挂到根路径，访问 / 直接打开可视化前端。
+V4：待办勾选完成——GET /api/notes 支持 status 过滤并返回 status 字段，
+    新增 PATCH /api/notes/{id}/status 让前端把待办勾成 done / 取消回 open。
 """
 
 from contextlib import asynccontextmanager
 import os
+from typing import Optional
 
 # Web 框架：FastAPI 提供路由、参数校验与自动生成 OpenAPI 文档
 from fastapi import FastAPI
@@ -63,23 +66,66 @@ def list_profiles():
     return [dict(row) for row in rows]  # sqlite3.Row 转普通 dict 便于 JSON 序列化
 
 
-# ===== V2 新增：GET /api/notes（前端待办区数据源） =====
+# ===== V2 新增 / V4 扩展：GET /api/notes（前端待办区数据源） =====
 @app.get("/api/notes")
-def list_open_notes():
-    """返回全部 open 状态的笔记，前端待办/记录区展示用。
+def list_notes(status: Optional[str] = None):
+    """返回笔记列表，前端待办/记录区展示用。
 
-    只暴露前端需要的四个字段；按 id 倒序让最新记录排在最前。
+    参数：
+        status：可选查询参数，只接受 'open' / 'done'；
+            不传表示返回全部（前端「全部」筛选）。
+    返回：note 对象列表，含前端画勾所需的 status 字段，按 id 倒序。
+    副作用：无（只读）。
+
+    V2 时这里写死 status='open'，V4 必须放开：前端要区分勾/未勾、
+    还要支持「已完成」筛选，只返回 open 会让 done 条目一勾就消失，
+    刷新后也无从显示。非法 status 显式报 400 而不是静默返回空列表，
+    否则拼错参数的前端只会看到「暂无待办」，问题很难定位。
     """
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, type, content, created_at
-            FROM notes
-            WHERE status = 'open'
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    if status is not None and status not in ("open", "done"):
+        raise HTTPException(status_code=400, detail="status 只能是 open 或 done")
+    # user_id 过滤下沉到 db 层（本地单用户固定 'local'），
+    # 保证接口不会把别的用户/别的来源的笔记混进前端列表
+    return db.list_notes(status=status)
+
+
+# ===== V4 新增：PATCH /api/notes/{id}/status（待办勾选完成） =====
+class NoteStatusPayload(BaseModel):
+    """PATCH /api/notes/{id}/status 的请求体。
+
+    这里声明成普通 str 而不是 Literal["open","done"]：用 Literal 时
+    非法值会被 FastAPI 拦成 422，本接口按约定必须返回 400，
+    所以合法性交给路由函数手工判断，模型只负责收字段。
+
+    模型定义紧贴使用它的路由：FastAPI 在注册路由时就要求该类型已存在，
+    写成前向引用（字符串）会解析失败，因此不能挪到文件后面的模型区。
+    """
+    status: str        # 目标状态：open / done，具体合法性在路由内校验
+
+
+@app.patch("/api/notes/{note_id}/status")
+def update_note_status(note_id: int, payload: NoteStatusPayload):
+    """把指定笔记的状态改成 open / done，返回更新后的完整 note 对象。
+
+    参数：
+        note_id：路径参数，笔记主键；
+        payload：请求体 {"status": "done"} 或 {"status": "open"}。
+    返回：更新后的 note dict（id/type/content/status/created_at）。
+    副作用：写库（UPDATE notes），因此前端勾选后刷新仍能保留状态。
+    异常：status 非 open/done → 400；笔记不存在（或不属于当前用户）→ 404。
+    """
+    # status 在这里手工校验而不是用 Pydantic 的 Literal：
+    # Literal 校验失败由 FastAPI 直接回 422，而任务要求非法值返 400；
+    # 手工判断才能给出中文 detail，前端 toast 可以直接展示
+    if payload.status not in ("open", "done"):
+        raise HTTPException(status_code=400, detail="status 只能是 open 或 done")
+
+    note = db.set_note_status(note_id, payload.status)
+    if note is None:
+        # db 层返回 None = UPDATE 未命中（id 不存在或不属于 user_id 范围）；
+        # 不能返回 200 空对象，否则前端会把「没改成」当成「改成功了」
+        raise HTTPException(status_code=404, detail="笔记不存在")
+    return note
 
 
 # ===== 请求体模型 =====

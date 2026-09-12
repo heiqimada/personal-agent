@@ -15,6 +15,12 @@ from datetime import datetime, timezone
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "data", "agent.db")
 
+# 本地单用户模式的固定用户标识。
+# 四张业务表都预留了 user_id 字段（默认 'local'），当前只跑本地单用户；
+# 集中定义成常量而不是各处硬编码字符串，将来接多用户时只需改这里
+# 或由调用方显式传参，不会出现「某处写 local 某处写 default」的脏数据。
+USER_ID = "local"
+
 
 # V0 建表语句：启动时执行 CREATE TABLE IF NOT EXISTS，可重复运行
 SCHEMA = """
@@ -171,12 +177,81 @@ def add_note(note_type, content):
     with get_conn() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO notes (type, content, status, created_at)
-            VALUES (?, ?, 'open', ?)
+            INSERT INTO notes (user_id, type, content, status, created_at)
+            VALUES (?, ?, ?, 'open', ?)
             """,
-            (note_type, content, now_iso()),
+            (USER_ID, note_type, content, now_iso()),
         )
         return cursor.lastrowid  # 返回自增 id 便于前端/工具确认记录位置
+
+
+def list_notes(status=None, user_id=USER_ID):
+    """列出某用户的笔记，可按状态过滤（前端待办区数据源）。
+
+    参数：
+        status：'open' / 'done'；传 None 表示不过滤（全部都要）；
+        user_id：数据归属用户，默认本地单用户。
+    返回：元素为 {"id","type","content","status","created_at"} 的列表，
+        按 id 倒序（最新记录在最前）。
+
+    为什么要 status 过滤能力：前端需要在「全部 / 待办 / 已完成」之间切换，
+    而下拉全量再在浏览器里筛会把无用的历史数据全塞进网络与内存；
+    过滤下推到 SQL 里，配合 user_id 条件能直接走库内的行过滤。
+    """
+    # 状态与用户值一律走 ? 占位符；这里只按条件拼「结构」不拼「值」，
+    # 因此不存在注入面（值永远由驱动转义后绑定）
+    sql = (
+        "SELECT id, type, content, status, created_at FROM notes WHERE user_id = ?"
+    )
+    params = [user_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY id DESC"
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_note_status(note_id, status, user_id=USER_ID):
+    """把某条笔记的状态改成 open/done，并返回更新后的整行数据。
+
+    参数：
+        note_id：笔记主键 id；
+        status：目标状态，只接受 'open' / 'done'（合法性由上层校验）；
+        user_id：数据归属用户，默认本地单用户。
+    返回：更新后的 note dict（含 status 字段）；笔记不存在或不属于
+        该用户时返回 None，由上层翻译成 404。
+    副作用：写库（UPDATE notes）。
+
+    为什么 UPDATE 的 WHERE 必须带 user_id：notes 表是多用户预留结构，
+    只按 id 改会在将来多用户时变成「拿到别人的 id 就能改别人的数据」；
+    代价只是多一个恒真条件，收益是把越权改数的可能性从根上掐掉。
+
+    为什么改完再查一次而不是直接 return 传入值：UPDATE 影响 0 行时
+    （id 不存在 / 不属于该用户）不能假装成功；同时以库里真实数据
+    为准返回，前端拿到的 status 一定是持久化后的权威值。
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE notes
+            SET status = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (status, note_id, user_id),
+        )
+        row = conn.execute(
+            """
+            SELECT id, type, content, status, created_at
+            FROM notes
+            WHERE id = ? AND user_id = ?
+            """,
+            (note_id, user_id),
+        ).fetchone()
+    # fetchone 无命中时返回 None，转成 None 让上层报 404 而不是编造一条假数据
+    return dict(row) if row is not None else None
 
 
 def add_profile(category, content, source="agent"):

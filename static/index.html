@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <!--
   模块职责：personal-agent 的单文件可视化前端（原生 HTML+CSS+JS）。
-  - 左侧/顶部侧边栏：展示 open 待办（GET /api/notes）；
+  - 左侧/顶部侧边栏：展示待办（GET /api/notes），支持勾选完成
+    （PATCH /api/notes/{id}/status）与「全部/待办/已完成」筛选；
+    勾选采用乐观更新，失败回滚并 toast 提示；
   - 主区：聊天界面（POST /api/chat），Agent 回复带「思考过程」折叠区。
   - 不引入任何框架与 CDN：样式和脚本全部内联，离线也能打开页面。
 -->
@@ -97,6 +99,34 @@
       gap: 8px;
     }
 
+    /* ===== 待办筛选（全部 / 待办 / 已完成） ===== */
+    .todo-filters {
+      display: flex;
+      gap: 6px;
+      padding: 8px 10px 0;
+    }
+
+    .filter-button {
+      flex: 1;                 /* 三等分铺满侧边栏，避免按钮宽度随文案抖动 */
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 12px;
+      padding: 5px 0;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+
+    .filter-button:hover {
+      color: var(--text);
+    }
+
+    .filter-button.active {
+      background: var(--primary-soft);
+      border-color: var(--primary);
+      color: var(--primary);
+    }
+
     .empty {
       color: var(--muted);
       text-align: center;
@@ -112,12 +142,42 @@
       word-break: break-word;
     }
 
+    /* 已完成条目整体置灰：状态一眼可辨，但条目不删除，保留可追溯性 */
+    .todo-item.done {
+      opacity: 0.6;
+    }
+
+    /* 删除线只加在正文上：直接写在卡片上会把标签、时间也划掉，反而难读 */
+    .todo-item.done .todo-content {
+      text-decoration: line-through;
+    }
+
     .todo-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
       margin-bottom: 6px;
+    }
+
+    /* 勾选框与正文同一行：flex-start 让勾选框顶部对齐正文首行 */
+    .todo-body {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .todo-check {
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;          /* 长文本换行时勾选框不许被压扁 */
+      margin: 1px 0 0;         /* 微调 1px，让勾与首行文字视觉居中对齐 */
+      cursor: pointer;
+      accent-color: var(--primary);  /* 跟随主题色，避免浏览器默认蓝绿跳色 */
+    }
+
+    .todo-check:disabled {
+      cursor: progress;        /* 请求在途：提示“正在保存”，同时防止连点 */
     }
 
     .tag {
@@ -146,6 +206,39 @@
     .todo-content {
       font-size: 13px;
       line-height: 1.45;
+      flex: 1;                 /* 占满勾选框之外的宽度，长文本正常换行 */
+      min-width: 0;
+    }
+
+    /* ===== 轻提示 toast：接口失败等一次性反馈，自动消失 ===== */
+    .toast-stack {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      z-index: 50;
+      /* 容器不吃点击事件，否则这块透明区域会挡住下方输入框 */
+      pointer-events: none;
+    }
+
+    .toast {
+      background: rgba(34, 48, 71, 0.92);
+      color: #ffffff;
+      font-size: 13px;
+      line-height: 1.4;
+      padding: 8px 14px;
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      max-width: 80vw;
+    }
+
+    /* 失败提示用危险色，和成功/中性提示区分开 */
+    .toast.error {
+      background: rgba(217, 75, 95, 0.95);
     }
 
     /* ===== 主区：聊天 ===== */
@@ -537,6 +630,13 @@
         <h1>待办</h1>
         <button class="icon-button" id="refresh-todos" type="button" title="刷新待办">⟳</button>
       </div>
+      <!-- 筛选切换：data-filter 的值直接作为 /api/notes?status= 的取值，
+           all 表示不传参（后端返回全部），避免前后端各维护一份映射 -->
+      <div class="todo-filters" id="todo-filters">
+        <button class="filter-button active" data-filter="all" type="button">全部</button>
+        <button class="filter-button" data-filter="open" type="button">待办</button>
+        <button class="filter-button" data-filter="done" type="button">已完成</button>
+      </div>
       <div class="todo-list" id="todo-list">
         <div class="empty">加载中…</div>
       </div>
@@ -566,6 +666,9 @@
       </form>
     </main>
   </div>
+
+  <!-- 轻提示挂载点：JS 动态往里塞 .toast，用完自动移除 -->
+  <div class="toast-stack" id="toast-stack"></div>
 
   <script>
     // ===== 会话标识：localStorage 持久化 =====
@@ -606,9 +709,32 @@
     const messageInputEl = document.getElementById("message-input");
     const sendButtonEl = document.getElementById("send-button");
     const refreshButtonEl = document.getElementById("refresh-todos");
+    const todoFiltersEl = document.getElementById("todo-filters");
+    const toastStackEl = document.getElementById("toast-stack");
 
     // 是否正在等后端：防止用户连续发送导致上下文/状态错乱
     let busy = false;
+
+    // 当前待办筛选：'all' / 'open' / 'done'，与 .filter-button 的 data-filter 一致。
+    // 只存这一份状态，渲染时按需拼查询参数，避免筛选状态散落在 DOM 里
+    let todoFilter = "all";
+
+    /**
+     * 弹出一次性轻提示（如接口失败），若干秒后自动消失。
+     * 参数：
+     *   message：提示文案；
+     *   kind：'info' / 'error'，error 用危险色区分。
+     * 返回值：无。
+     * 副作用：向 #toast-stack 追加节点并延时移除。
+     */
+    function showToast(message, kind) {
+      const toast = createEl("div", "toast" + (kind === "error" ? " error" : ""), message);
+      toastStackEl.appendChild(toast);
+      // 2.6s 后移除：足够读完一句短提示，又不会长期占屏
+      setTimeout(function () {
+        toast.remove();
+      }, 2600);
+    }
 
     /**
      * 取（或创建并持久化）本浏览器的 session_id。
@@ -676,11 +802,15 @@
      * 拉取 /api/notes 并渲染待办列表。
      * 页面加载与每次聊天结束都会调用——Agent 的 create_note
      * 会写库，只有重新拉取侧边栏才能看到最新记录。
+     * 当前筛选（全部/待办/已完成）会拼成 status 查询参数下推到后端，
+     * 由数据库完成过滤，而不是把全量数据拉到浏览器再筛。
      */
     async function loadTodos() {
       todoListEl.replaceChildren(createEl("div", "empty", "加载中…"));
       try {
-        const response = await fetch("/api/notes");
+        // todoFilter 为 'all' 时不带参数，语义与后端「不过滤」一致
+        const query = todoFilter === "all" ? "" : "?status=" + todoFilter;
+        const response = await fetch("/api/notes" + query);
         if (!response.ok) {
           throw new Error("HTTP " + response.status);
         }
@@ -696,11 +826,18 @@
 
     /**
      * 把待办数组渲染成侧边栏卡片列表。
-     * 参数：items——后端返回的 [{id, type, content, created_at}, ...]。
+     * 参数：items——后端返回的 [{id, type, content, status, created_at}, ...]。
      */
     function renderTodos(items) {
       if (!Array.isArray(items) || items.length === 0) {
-        todoListEl.replaceChildren(createEl("div", "empty", "暂无待办"));
+        // 空态文案跟随筛选：说清「没有待办」和「还没有已完成的」是两回事
+        const emptyText =
+          todoFilter === "done"
+            ? "还没有已完成的条目"
+            : todoFilter === "open"
+              ? "没有待办事项"
+              : "暂无待办";
+        todoListEl.replaceChildren(createEl("div", "empty", emptyText));
         return;
       }
 
@@ -716,11 +853,92 @@
         top.appendChild(createEl("span", "tag " + tagClass, tagText));
         top.appendChild(createEl("span", "todo-time", formatTime(item.created_at)));
 
+        // 正文行 = 勾选框 + 内容；勾选状态以后端 status 为唯一事实来源，
+        // 旧数据没有 status 字段时按 open 处理，避免渲染出「已勾选」的假象
+        const body = createEl("div", "todo-body");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.className = "todo-check";
+        checkbox.checked = item.status === "done";
+        checkbox.title = checkbox.checked ? "标记为未完成" : "标记为已完成";
+        checkbox.setAttribute("aria-label", "标记“" + (item.content || "") + "”");
+        // done 的条目立刻带上置灰样式，和后端返回的状态保持一致
+        card.classList.toggle("done", checkbox.checked);
+        checkbox.addEventListener("change", function () {
+          toggleTodoStatus(item, card, checkbox);
+        });
+        body.appendChild(checkbox);
+        body.appendChild(createEl("div", "todo-content", item.content || ""));
+
         card.appendChild(top);
-        card.appendChild(createEl("div", "todo-content", item.content || ""));
+        card.appendChild(body);
         fragment.appendChild(card);
       });
       todoListEl.replaceChildren(fragment);
+    }
+
+    /**
+     * 切换单条待办的完成状态，并把新状态同步到后端。
+     * 参数：
+     *   item：渲染时的待办对象（会被就地更新 status，作为乐观更新的本地副本）；
+     *   card：该条目的卡片节点（切 .done 样式）；
+     *   checkbox：勾选框节点（成功后按服务端返回值校正）。
+     * 返回值：无（异步过程；失败时回滚 UI 并弹 toast）。
+     * 副作用：PATCH /api/notes/{id}/status，成功后改写数据库 status 字段。
+     */
+    async function toggleTodoStatus(item, card, checkbox) {
+      const prevStatus = item.status === "done" ? "done" : "open";
+      const nextStatus = prevStatus === "done" ? "open" : "done";
+
+      // 1) 乐观更新：先按用户点击把界面改掉，避免「点完等半秒才动」的卡顿感
+      item.status = nextStatus;
+      card.classList.toggle("done", nextStatus === "done");
+      checkbox.checked = nextStatus === "done";
+      checkbox.title = nextStatus === "done" ? "标记为未完成" : "标记为已完成";
+      checkbox.disabled = true;  // 请求在途时禁点，避免连点把状态来回打架
+
+      try {
+        const response = await fetch(
+          "/api/notes/" + encodeURIComponent(item.id) + "/status",
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: nextStatus })
+          }
+        );
+        if (!response.ok) {
+          // 后端失败细节（400 非法状态 / 404 笔记不存在）优先透传给用户
+          let detail = "";
+          try {
+            const data = await response.json();
+            detail = data && data.detail ? String(data.detail) : "";
+          } catch (error) {
+            detail = "";
+          }
+          throw new Error(detail || "HTTP " + response.status);
+        }
+        // 2) 以服务端返回的权威状态再校正一次界面，
+        //    防止将来后端对状态做归一化时前端显示与库里不一致
+        const updated = await response.json();
+        item.status = updated && updated.status ? updated.status : nextStatus;
+        card.classList.toggle("done", item.status === "done");
+        checkbox.checked = item.status === "done";
+        checkbox.title = checkbox.checked ? "标记为未完成" : "标记为已完成";
+      } catch (error) {
+        // 3) 回滚：接口失败必须把界面退回点击前的样子，
+        //    否则用户以为勾上了，实际数据库里还是原状态
+        console.error("待办状态更新失败：", error);
+        item.status = prevStatus;
+        card.classList.toggle("done", prevStatus === "done");
+        checkbox.checked = prevStatus === "done";
+        checkbox.title = prevStatus === "done" ? "标记为未完成" : "标记为已完成";
+        showToast("勾选没保存成功：" + (error.message || "未知错误"), "error");
+      } finally {
+        checkbox.disabled = false;
+        // 说明：这里不重新拉列表。在「待办/已完成」筛选下，重新拉取会让
+        // 刚勾掉的条目当场消失（用户还没看清结果）；留到下次
+        // 刷新/切换筛选时再按最新状态过滤即可
+      }
     }
 
     /**
@@ -1078,6 +1296,24 @@
 
     messageInputEl.addEventListener("input", autoResizeInput);
     refreshButtonEl.addEventListener("click", loadTodos);
+
+    // 筛选按钮：委托到容器上统一监听，将来加筛选项不用逐个绑事件
+    todoFiltersEl.addEventListener("click", function (event) {
+      const button = event.target.closest(".filter-button");
+      if (!button) {
+        return;
+      }
+      const nextFilter = button.dataset.filter || "all";
+      if (nextFilter === todoFilter) {
+        return;  // 重复点当前筛选不重新请求，省一次无用网络往返
+      }
+      todoFilter = nextFilter;
+      // 高亮态直接由 data-filter 对照，保证按钮与状态永远一致
+      todoFiltersEl.querySelectorAll(".filter-button").forEach(function (node) {
+        node.classList.toggle("active", node.dataset.filter === todoFilter);
+      });
+      loadTodos();
+    });
 
     // 首屏欢迎语放在真实对话之外，不用“思考过程”模板
     const welcome = createEl("div", "message agent");
